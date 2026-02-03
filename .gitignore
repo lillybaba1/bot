@@ -1,0 +1,52 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+*.log.*
+crash_log.txt
+
+# Data (user-specific)
+trade_history.json
+ai_decisions.json
+julaba_config.json
+chat_history.json
+security_log.json
+
+# Backup files
+*.backup
+*.bak
+*_backup.json
+*.corrupted*
+*.truncated
+
+# Lock files
+*.lock
+
+# Charts and data
+charts/
+historical_data/*.csv
+
+# Models (optional - remove if you want to include trained models)
+models/*.json
+
+# System
+.DS_Store
+Thumbs.db
