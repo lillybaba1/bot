@@ -1,0 +1,107 @@
+{
+  "symbol": "BTC/USDT:USDT",
+  "balance": 1000.0,
+  "initial_balance": 1000.0,
+  "peak_balance": 1000.0,
+  "consecutive_wins": 0,
+  "consecutive_losses": 0,
+  "stats": {
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "total_pnl": 0.0,
+    "today_pnl": 0.0,
+    "max_win": 0.0,
+    "max_loss": 0.0
+  },
+  "open_position": null,
+  "multi_positions": {},
+  "position_slots": {},
+  "prefilter_stats": {
+    "total_signals": 0,
+    "passed": 0,
+    "blocked_score": 0,
+    "blocked_adx_low": 0,
+    "blocked_adx_danger": 0,
+    "blocked_volume": 0,
+    "blocked_confluence": 0,
+    "blocked_divergence": 0,
+    "blocked_btc_filter": 0,
+    "raw_signals": 0,
+    "by_regime": {},
+    "blocked_regime": 0
+  },
+  "equity_curve": [],
+  "trading_mode": "paper",
+  "last_updated": "",
+  "adaptive_params": {
+    "atr_mult": {
+      "current": 3.5,
+      "min": 1.5,
+      "max": 4.0,
+      "step": 0.25,
+      "desc": "Stop loss ATR multiplier"
+    },
+    "trail_trigger_r": {
+      "current": 1.0,
+      "min": 0.3,
+      "max": 1.5,
+      "step": 0.1,
+      "desc": "Trailing stop activation R"
+    },
+    "short_score_bonus": {
+      "current": 0,
+      "min": 0,
+      "max": 15,
+      "step": 1,
+      "desc": "Short signal bonus points"
+    },
+    "min_score_threshold": {
+      "current": 57,
+      "min": 20,
+      "max": 60,
+      "step": 5,
+      "desc": "Minimum score to pass pre-filter"
+    },
+    "tp1_r": {
+      "current": 1.0,
+      "min": 0.8,
+      "max": 1.5,
+      "step": 0.1,
+      "desc": "First take profit R multiple"
+    },
+    "tp2_r": {
+      "current": 1.5,
+      "min": 1.2,
+      "max": 2.5,
+      "step": 0.1,
+      "desc": "Second take profit R multiple"
+    },
+    "risk_pct": {
+      "current": 0.02,
+      "min": 0.01,
+      "max": 0.1,
+      "step": 0.01,
+      "desc": "Risk % per trade"
+    },
+    "max_leverage": {
+      "current": 10,
+      "min": 5,
+      "max": 30,
+      "step": 5,
+      "desc": "Maximum leverage"
+    },
+    "max_concurrent_positions": {
+      "current": 2,
+      "min": 1,
+      "max": 4,
+      "step": 1,
+      "desc": "Max simultaneous positions"
+    }
+  },
+  "last_switch_time": 0,
+  "allowed_sides": "both",
+  "pair_cooldowns": {},
+  "balance_protection": 100,
+  "min_balance_to_trade": 100
+}
