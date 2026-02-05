@@ -197,6 +197,21 @@ class TelegramNotifier:
         
         self.app = Application.builder().token(self.token).build()
         
+        # Add timestamp filter to prevent old commands after restart
+        from telegram.ext import MessageHandler, filters
+        async def timestamp_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Filter out commands older than 5 minutes to prevent stale commands after restart."""
+            if update.message and update.message.date:
+                from datetime import datetime, timezone, timedelta
+                msg_age = datetime.now(timezone.utc) - update.message.date
+                if msg_age > timedelta(minutes=5):
+                    logger.debug(f"🚫 Ignored stale command: /{update.message.text.split()[0] if update.message.text else 'unknown'} ({msg_age.total_seconds():.0f}s old)")
+                    return False  # Block the message
+            return True  # Allow the message
+        
+        # This filter will be applied to all command handlers automatically
+        # by adding it as a base filter (but we'll handle it per-command instead for clarity)
+        
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self._cmd_start))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
@@ -221,6 +236,8 @@ class TelegramNotifier:
         self.app.add_handler(CommandHandler("ml", self._cmd_ml))
         self.app.add_handler(CommandHandler("regime", self._cmd_regime))
         self.app.add_handler(CommandHandler("summary", self._cmd_summary))
+        # NEW: News and market sentiment
+        self.app.add_handler(CommandHandler("news", self._cmd_news))
         # NEW: Enhanced commands
         self.app.add_handler(CommandHandler("risk", self._cmd_risk))
         self.app.add_handler(CommandHandler("mtf", self._cmd_mtf))
@@ -296,7 +313,7 @@ class TelegramNotifier:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(
-            drop_pending_updates=True,
+            drop_pending_updates=False,  # Process pending updates (filtered by timestamp below)
             allowed_updates=["message", "callback_query"],
             bootstrap_retries=-1  # Retry indefinitely on startup conflicts
         )
@@ -777,6 +794,7 @@ _Keep trading smart! 🤖_
 /regime - Current market regime analysis
 /risk - Risk manager status & limits
 /mtf - Multi-timeframe analysis
+/news - Market news, sentiment & whale alerts
 
 🎛️ *AI Auto-Tune Commands:*
 /params - View AI-tunable parameters
@@ -812,6 +830,11 @@ _Keep trading smart! 🤖_
     
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command."""
+        # Ignore stale commands from before restart
+        if not self._is_command_fresh(update):
+            return
+        
+        logger.info(f"📱 Telegram command received: /status from user {update.effective_user.username}")
         try:
             if self.get_status:
                 s = self.get_status()
@@ -1055,6 +1078,106 @@ _Keep trading smart! 🤖_
             msg = "⚠️ Regime analysis not available"
         
         await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def _cmd_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /news command - show current market news and sentiment."""
+        try:
+            from news_monitor import NewsMonitor
+            
+            # Use existing monitor if available, or create new one
+            monitor = getattr(self, '_news_monitor', None) or NewsMonitor()
+            
+            # Fetch summary
+            summary = await monitor.get_market_summary()
+            
+            # Build response
+            msg = "📰 *Market News & Sentiment*\n\n"
+            
+            # Fear & Greed
+            sentiment = summary.get('sentiment')
+            if sentiment:
+                fg = sentiment.get('fear_greed_index', 50)
+                fg_label = sentiment.get('fear_greed_label', 'Unknown')
+                
+                # Emoji based on fear/greed
+                if fg <= 25:
+                    fg_emoji = '😱'  # Extreme fear
+                elif fg <= 40:
+                    fg_emoji = '😰'  # Fear
+                elif fg >= 75:
+                    fg_emoji = '🤑'  # Extreme greed
+                elif fg >= 60:
+                    fg_emoji = '😊'  # Greed
+                else:
+                    fg_emoji = '😐'  # Neutral
+                
+                msg += f"{fg_emoji} *Fear & Greed:* `{fg}` ({fg_label})\n"
+                
+                if sentiment.get('market_cap_change_24h'):
+                    change = sentiment['market_cap_change_24h']
+                    change_emoji = '📈' if change > 0 else '📉'
+                    msg += f"{change_emoji} *Market 24h:* `{change:+.2f}%`\n"
+                
+                if sentiment.get('btc_dominance'):
+                    msg += f"₿ *BTC Dominance:* `{sentiment['btc_dominance']:.1f}%`\n"
+            
+            # News summary
+            ns = summary.get('news_summary', {})
+            if ns:
+                msg += f"\n📊 *News Summary:*\n"
+                msg += f"• Total: `{ns.get('total_articles', 0)}` articles\n"
+                msg += f"• Bullish: `{ns.get('bullish_count', 0)}` | Bearish: `{ns.get('bearish_count', 0)}`\n"
+                msg += f"• Avg Sentiment: `{ns.get('average_sentiment', 0):+.2f}`\n"
+            
+            # Critical news
+            critical = summary.get('critical_news', [])
+            if critical:
+                msg += f"\n🚨 *Critical News:*\n"
+                for n in critical[:3]:
+                    msg += f"• {n.get('title', '')[:50]}...\n"
+            
+            # Recent headlines (show even if no critical news)
+            recent = summary.get('recent_news', [])
+            if recent and not critical:
+                msg += f"\n📰 *Recent Headlines:*\n"
+                for n in recent[:5]:
+                    title = n.get('title', '')[:60]
+                    sentiment_score = n.get('sentiment', 0)
+                    sent_emoji = '🟢' if sentiment_score > 0.2 else ('🔴' if sentiment_score < -0.2 else '⚪')
+                    msg += f"{sent_emoji} {title}...\n"
+            
+            # Liquidations
+            liq = summary.get('liquidations', {})
+            if liq and liq.get('total_24h_usd', 0) > 0:
+                msg += f"\n💥 *Liquidations 24h:*\n"
+                msg += f"• Total: `${liq.get('total_24h_usd', 0)/1e6:.1f}M`\n"
+                msg += f"• Alert: `{liq.get('alert_level', 'normal').upper()}`\n"
+            
+            # Whale alerts
+            whales = summary.get('whale_alerts', [])
+            if whales:
+                btc_whales = [w for w in whales if w.get('coin') == 'BTC'][:2]
+                if btc_whales:
+                    msg += f"\n🐋 *Whale Activity:*\n"
+                    for w in btc_whales:
+                        msg += f"• {w.get('amount', 0):.0f} BTC moving\n"
+            
+            # Trading bias
+            bias = monitor.get_trading_bias()
+            msg += f"\n⚡ *Trading Bias:* `{bias.get('bias', 'neutral').upper()}` ({bias.get('confidence', 50):.0%})\n"
+            
+            # Recommendation (truncated)
+            rec = summary.get('recommendation', '')
+            if rec:
+                # Get just the first line
+                first_line = rec.split('\n')[0]
+                msg += f"\n💡 {first_line}"
+            
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Error in /news command: {e}")
+            await update.message.reply_text(f"❌ Error fetching news: {e}")
 
     async def _cmd_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /summary command - toggle summary notifications on/off."""

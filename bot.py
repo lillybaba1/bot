@@ -18,8 +18,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+
+# Custom JSON encoder for numpy types
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 
 # Load environment variables
 load_dotenv()
@@ -203,18 +218,18 @@ def validate_ohlcv_data(ohlcv: List, symbol: str = "UNKNOWN") -> List:
     return valid_candles
 
 
-def validate_price(price: float, entry_price: float = None, symbol: str = "UNKNOWN", max_deviation_pct: float = 50.0) -> bool:
+def validate_price(price: float, entry_price: float = None, symbol: str = "UNKNOWN", max_deviation_pct: float = 75.0) -> bool:
     """Validate that a price is reasonable and not garbage data.
     
     Returns True if price is valid, False otherwise.
     Protects against:
     - Negative prices
     - Zero prices
-    - Extreme prices (> max_deviation_pct% from entry) - default 50%
+    - Extreme prices (> max_deviation_pct% from entry) - default 75%
     - NaN/Infinity values
     
-    The 50% default catches garbage data like 0.29 when price should be 0.19 (52% off)
-    while still allowing for legitimate volatile moves.
+    The 75% default allows for volatile meme coin moves while still catching
+    obvious garbage data like wrong decimal places.
     """
     import math
     
@@ -291,8 +306,18 @@ class Position:
     tp2_hit: bool = False
     tp3_hit: bool = False
     trailing_stop: Optional[float] = None
+    original_r_value: float = 0.0  # Store original risk value for trailing (don't recalculate after BE)
     opened_at: datetime = field(default_factory=datetime.utcnow)
     entry_df_snapshot: Optional[pd.DataFrame] = None  # For ML learning
+    # Peak profit tracking for intelligent reversal detection (like Bybit display)
+    peak_profit_pct: float = 0.0  # Peak profit in percentage (primary metric)
+    peak_profit_usd: float = 0.0  # Peak profit in USD (secondary, for logging)
+    # Loss depth tracking for real-time recovery monitoring (negative side of peak tracking)
+    deepest_loss_pct: float = 0.0  # Deepest loss in percentage (tracks worst drawdown)
+    deepest_loss_usd: float = 0.0  # Deepest loss in USD
+    recovery_attempts: int = 0  # Count how many times we tried to recover
+    last_recovery_check: datetime = field(default_factory=datetime.utcnow)  # Prevent spam
+    in_recovery_mode: bool = False  # Flag when actively monitoring recovery
     
     @property
     def remaining_size(self) -> float:
@@ -972,6 +997,7 @@ class Julaba:
         """Record a trade that was closed externally (manually on Bybit).
         
         Fetches the actual close price and PnL from recent closed PnL history on Bybit.
+        CRITICAL: Only record if we can VERIFY the position was actually closed.
         """
         try:
             symbol = getattr(pos, 'symbol', 'UNKNOWN')
@@ -981,8 +1007,9 @@ class Julaba:
             opened_at = getattr(pos, 'opened_at', datetime.utcnow())
             
             # Try to get actual close price and PnL from Bybit closed PnL
-            close_price = entry_price  # Default to entry if we can't get actual close
+            close_price = None  # Start with None - we MUST get actual close price
             realized_pnl = 0.0
+            verified_closed = False
             
             try:
                 # Method 1: Try Bybit's closed PnL endpoint (most accurate for futures)
@@ -992,49 +1019,69 @@ class Julaba:
                 closed_pnl = self.exchange.privateGetV5PositionClosedPnl({
                     'category': 'linear',
                     'symbol': normalize_symbol(symbol),  # PTBUSDT format
-                    'limit': 5
+                    'limit': 10  # Check more records
                 })
                 
                 if closed_pnl and closed_pnl.get('result', {}).get('list'):
+                    # Get the position open time to match the right closure
+                    pos_open_time = opened_at if isinstance(opened_at, datetime) else datetime.utcnow()
+                    
                     for record in closed_pnl['result']['list']:
-                        # Get the most recent close for this position
-                        record_pnl = float(record.get('closedPnl', 0))
-                        avg_exit_price = float(record.get('avgExitPrice', entry_price))
+                        # Check if this close record is AFTER our position opened
+                        close_time_ms = int(record.get('updatedTime', 0))
+                        close_time = datetime.fromtimestamp(close_time_ms / 1000)
                         
-                        if avg_exit_price > 0:
-                            close_price = avg_exit_price
-                            realized_pnl = record_pnl
-                            logger.info(f"📊 Got closed PnL from Bybit: exit=${close_price:.6f}, PnL=${realized_pnl:.2f}")
-                            break
+                        if close_time > pos_open_time:
+                            record_pnl = float(record.get('closedPnl', 0))
+                            avg_exit_price = float(record.get('avgExitPrice', 0))
+                            
+                            if avg_exit_price > 0:
+                                close_price = avg_exit_price
+                                realized_pnl = record_pnl
+                                verified_closed = True
+                                logger.info(f"📊 VERIFIED closed PnL from Bybit: exit=${close_price:.6f}, PnL=${realized_pnl:.2f}")
+                                break
                             
             except Exception as pnl_err:
                 logger.debug(f"Could not fetch closed PnL from Bybit: {pnl_err}")
                 
-                # Method 2: Fallback - try to get from recent trades
+            # Method 2: Fallback - try to get from recent trades (only if not verified yet)
+            if not verified_closed:
                 try:
                     if hasattr(self.exchange, 'fetch_my_trades'):
                         ccxt_symbol = symbol if '/' in symbol else f"{symbol.replace('USDT', '')}/USDT:USDT"
                         trades = await self.exchange.fetch_my_trades(ccxt_symbol, limit=10)
+                        pos_open_time = opened_at if isinstance(opened_at, datetime) else datetime.utcnow()
+                        
                         for t in reversed(trades):
                             if normalize_symbol(t.get('symbol', '')) == normalize_symbol(symbol):
-                                close_price = float(t.get('price', entry_price))
-                                # Calculate PnL based on direction
-                                if side.lower() == 'long':
-                                    realized_pnl = (close_price - entry_price) * size
-                                else:
-                                    realized_pnl = (entry_price - close_price) * size
-                                logger.info(f"📊 Got close price from trades: exit=${close_price:.6f}, calculated PnL=${realized_pnl:.2f}")
-                                break
+                                trade_time = datetime.fromisoformat(t.get('datetime', '').replace('Z', '+00:00'))
+                                # Only use trades that happened AFTER position opened
+                                if trade_time > pos_open_time:
+                                    close_price = float(t.get('price', 0))
+                                    if close_price > 0:
+                                        # Calculate PnL based on direction
+                                        if side.lower() == 'long':
+                                            realized_pnl = (close_price - entry_price) * size
+                                        else:
+                                            realized_pnl = (entry_price - close_price) * size
+                                        verified_closed = True
+                                        logger.info(f"📊 VERIFIED close from trades: exit=${close_price:.6f}, calculated PnL=${realized_pnl:.2f}")
+                                        break
                 except Exception as trade_err:
                     logger.debug(f"Could not fetch trades from Bybit: {trade_err}")
             
-            # Only calculate PnL manually if we couldn't get it from Bybit
-            if realized_pnl == 0 and close_price != entry_price:
-                if side.lower() == 'long':
-                    realized_pnl = (close_price - entry_price) * size
-                else:  # short
-                    realized_pnl = (entry_price - close_price) * size
-                logger.info(f"📊 Manually calculated PnL: ${realized_pnl:.2f}")
+            # === CRITICAL: Only record if we VERIFIED the position was actually closed ===
+            if not verified_closed or close_price is None:
+                logger.warning(f"⚠️ Could not VERIFY {symbol} was closed - NOT recording fake trade")
+                logger.warning(f"⚠️ Position may still be open or API timing issue - will re-sync later")
+                return False
+            
+            # Validate price makes sense
+            price_deviation = abs(close_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+            if price_deviation > 30:
+                logger.error(f"🚨 REJECTING external close with {price_deviation:.1f}% price deviation for {symbol}")
+                return False
             
             # Determine win/loss
             result = 'WIN' if realized_pnl > 0 else 'LOSS' if realized_pnl < 0 else 'BREAKEVEN'
@@ -1054,8 +1101,10 @@ class Julaba:
                 'closed_at': datetime.utcnow().isoformat(),
                 'close_reason': 'MANUAL_CLOSE',
                 'ai_approved': False,
-                'notes': 'Externally closed (manual close on Bybit)'
+                'notes': 'Externally closed (verified from Bybit API)'
             }
+            
+            logger.info(f"📊 Recording verified external close: {symbol} {side.upper()} Entry=${entry_price:.6f} Exit=${close_price:.6f} PnL=${realized_pnl:.2f}")
             
             # Record the trade
             if self._record_trade_safe(trade_record):
@@ -1309,6 +1358,7 @@ class Julaba:
                             tp2_hit=pos.get('tp2_hit', False),
                             tp3_hit=pos.get('tp3_hit', False),
                             trailing_stop=pos.get('trailing_stop'),
+                            original_r_value=pos.get('original_r_value', abs(pos['entry_price'] - pos['stop_loss'])),
                             opened_at=datetime.fromisoformat(pos['opened_at']) if pos.get('opened_at') else datetime.utcnow()
                         )
                         logger.info(f"📈 RESTORED OPEN POSITION: {self.position.side.upper()} {self.position.symbol} @ ${self.position.entry_price:.4f}")
@@ -1335,13 +1385,19 @@ class Julaba:
                                 tp2_hit=pos_data.get('tp2_hit', False),
                                 tp3_hit=pos_data.get('tp3_hit', False),
                                 trailing_stop=pos_data.get('trailing_stop'),
+                                original_r_value=pos_data.get('original_r_value', abs(pos_data['entry_price'] - pos_data['stop_loss'])),
                                 opened_at=datetime.fromisoformat(pos_data['opened_at']) if pos_data.get('opened_at') else datetime.utcnow()
                             )
                             # Restore peak profit tracking for intelligent reversal detection
                             restored_pos.peak_profit_usd = pos_data.get('peak_profit_usd', 0)
                             restored_pos.peak_profit_pct = pos_data.get('peak_profit_pct', 0)
+                            # Restore loss depth tracking for real-time recovery
+                            restored_pos.deepest_loss_pct = pos_data.get('deepest_loss_pct', 0)
+                            restored_pos.deepest_loss_usd = pos_data.get('deepest_loss_usd', 0)
+                            restored_pos.recovery_attempts = pos_data.get('recovery_attempts', 0)
+                            restored_pos.in_recovery_mode = pos_data.get('in_recovery_mode', False)
                             self.positions[symbol] = restored_pos
-                            logger.info(f"📈 RESTORED MULTI-POSITION: {restored_pos.side.upper()} {symbol} @ ${restored_pos.entry_price:.4f} (Peak: ${restored_pos.peak_profit_usd:.2f})")
+                            logger.info(f"📈 RESTORED MULTI-POSITION: {restored_pos.side.upper()} {symbol} @ ${restored_pos.entry_price:.4f} (Peak: ${restored_pos.peak_profit_usd:.2f}, Deepest: {restored_pos.deepest_loss_pct:.2f}%)")
                         except Exception as e:
                             logger.error(f"Failed to restore multi-position {symbol}: {e}")
                             self.positions[symbol] = None
@@ -1404,15 +1460,15 @@ class Julaba:
             # ALWAYS recalculate stats from trade_history (source of truth)
             self._recalculate_stats_from_history()
             
-            # Save stats
+            # Save stats (convert to native Python types to avoid numpy int64 serialization errors)
             config['stats'] = {
-                'total_trades': self.stats.total_trades,
-                'winning_trades': self.stats.winning_trades,
-                'losing_trades': self.stats.losing_trades,
-                'total_pnl': self.stats.total_pnl,
-                'today_pnl': self.stats.today_pnl,
-                'max_win': self.stats.max_win,
-                'max_loss': self.stats.max_loss
+                'total_trades': int(self.stats.total_trades),
+                'winning_trades': int(self.stats.winning_trades),
+                'losing_trades': int(self.stats.losing_trades),
+                'total_pnl': float(self.stats.total_pnl),
+                'today_pnl': float(self.stats.today_pnl),
+                'max_win': float(self.stats.max_win),
+                'max_loss': float(self.stats.max_loss)
             }
             
             # Remove legacy trade_history from config if present (now in dedicated file)
@@ -1452,6 +1508,7 @@ class Julaba:
                     'tp2_hit': self.position.tp2_hit,
                     'tp3_hit': self.position.tp3_hit,
                     'trailing_stop': self.position.trailing_stop,
+                    'original_r_value': getattr(self.position, 'original_r_value', 0),
                     'opened_at': self.position.opened_at.isoformat() if self.position.opened_at else None
                 }
                 logger.debug(f"💾 Saved open position: {self.position.side} {self.position.symbol}")
@@ -1476,10 +1533,15 @@ class Julaba:
                             'tp2_hit': pos.tp2_hit,
                             'tp3_hit': pos.tp3_hit,
                             'trailing_stop': pos.trailing_stop,
+                            'original_r_value': getattr(pos, 'original_r_value', 0),
                             'opened_at': pos.opened_at.isoformat() if pos.opened_at else None,
                             # Peak profit tracking for intelligent reversal detection
                             'peak_profit_usd': getattr(pos, 'peak_profit_usd', 0),
-                            'peak_profit_pct': getattr(pos, 'peak_profit_pct', 0)
+                            'peak_profit_pct': getattr(pos, 'peak_profit_pct', 0),
+                            'deepest_loss_pct': getattr(pos, 'deepest_loss_pct', 0),
+                            'deepest_loss_usd': getattr(pos, 'deepest_loss_usd', 0),
+                            'recovery_attempts': getattr(pos, 'recovery_attempts', 0),
+                            'in_recovery_mode': getattr(pos, 'in_recovery_mode', False)
                         }
                 config['multi_positions'] = multi_positions
                 logger.debug(f"💾 Saved {len(multi_positions)} open positions to multi-position dict")
@@ -1502,7 +1564,7 @@ class Julaba:
             # This prevents corruption from interrupted writes
             temp_file = Path(str(self.CONFIG_FILE) + '.tmp')
             with open(temp_file, 'w') as f:
-                json.dump(config, f, indent=2)
+                json.dump(config, f, indent=2, cls=NumpyEncoder)
             temp_file.rename(self.CONFIG_FILE)  # Atomic on POSIX systems
             logger.debug(f"💾 Saved trading state: ${self.balance:,.2f}")
         except Exception as e:
@@ -2006,6 +2068,7 @@ Respond ONLY with this JSON format:
             self.balance += pnl_usd
             self.stats.today_pnl += pnl_usd
             self.stats.total_pnl += pnl_usd
+            self.weekly_pnl += pnl_usd  # Track weekly P&L for circuit breaker
             self.stats.total_trades += 1
             if is_win:
                 self.stats.winning_trades += 1
@@ -2708,6 +2771,16 @@ User Question: {message}
         self.daily_loss_reset_date = None  # Track when to reset
         self.daily_loss_override_until = None  # Manual override expires at this date
         
+        # === WEEKLY LOSS LIMIT (Circuit Breaker) ===
+        self.weekly_loss_limit = 0.10  # 10% max weekly loss
+        self.weekly_loss_triggered = False  # Weekly circuit breaker state
+        self.weekly_loss_reset_week = None  # Track ISO week number for reset
+        self.weekly_pnl = 0.0  # Track weekly P&L
+        
+        # === MAX DRAWDOWN CIRCUIT BREAKER ===
+        self.max_drawdown_limit = 0.20  # 20% max drawdown from peak
+        self.max_drawdown_triggered = False  # Ultimate circuit breaker
+        
         # === BTC CRASH PROTECTION ===
         self.btc_crash_cooldown = False
         self.btc_crash_cooldown_until = None
@@ -2830,6 +2903,8 @@ User Question: {message}
         # PhD-optimal: React to every price tick, not just 5-second polling
         # This ensures we NEVER miss a TP/SL level being hit
         self.ws_price_stream = WebSocketPriceStream(self, symbols=[])
+        # Register recovery tracker callback for real-time loss monitoring
+        # Note: ws_position_stream is created separately, register callback later
         self.ws_position_stream = WebSocketPositionStream(self)  # Real-time position sync
         self.ws_enabled = True  # Can be disabled if causing issues
         
@@ -3940,7 +4015,7 @@ Format with markdown for readability."""
                 
                 if last_open_time:
                     mins_since_last = (datetime.utcnow() - last_open_time).total_seconds() / 60
-                    MIN_COOLDOWN_MINUTES = 5  # Wait at least 5 mins between position opens
+                    MIN_COOLDOWN_MINUTES = 1  # Wait at least 1 min between position opens (was 5)
                     if mins_since_last < MIN_COOLDOWN_MINUTES:
                         logger.info(f"📊 Position cooldown: {mins_since_last:.1f}min since last open (need {MIN_COOLDOWN_MINUTES}min)")
                         return
@@ -5955,6 +6030,14 @@ Keep response under 150 words. Be direct and actionable."""
                         "message": "Position opening FAILED - order may not have executed. Check Bybit."
                     }
                 
+                # FIX: Update _symbol_prices so PnL displays correctly immediately
+                symbol_key = self.SYMBOL.upper().replace('/', '').replace(':USDT', '')
+                if not hasattr(self, '_symbol_prices'):
+                    self._symbol_prices = {}
+                self._symbol_prices[symbol_key] = price
+                logger.debug(f"📊 Updated _symbol_prices[{symbol_key}] = ${price:.4f} for immediate PnL display")
+                    }
+                
             else:
                 # Different symbol - need to fetch its data and use _open_position_for_symbol
                 logger.info(f"📊 Fetching data for {target_symbol}...")
@@ -6019,6 +6102,13 @@ Keep response under 150 words. Be direct and actionable."""
                         "success": False,
                         "message": f"Position opening FAILED for {target_symbol} - order may not have executed. Check Bybit."
                     }
+                
+                # FIX: Update _symbol_prices so PnL displays correctly immediately
+                symbol_key = target_symbol.upper().replace('/', '').replace(':USDT', '')
+                if not hasattr(self, '_symbol_prices'):
+                    self._symbol_prices = {}
+                self._symbol_prices[symbol_key] = price
+                logger.debug(f"📊 Updated _symbol_prices[{symbol_key}] = ${price:.4f} for immediate PnL display")
             
             return {
                 "success": True,
@@ -6982,45 +7072,65 @@ Keep response under 150 words. Be direct and actionable."""
                             json.dump(existing_trades, f, indent=2)
                         logger.info(f"💾 Backed up {len(existing_trades)} live trades to {live_backup_file}")
                 
-                # 2. Clear trade history
-                with open(self.TRADE_HISTORY_FILE, 'w') as f:
-                    json.dump([], f)
-                logger.info("🗑️ Cleared trade history for paper mode")
+                # 3. Restore paper trade history from backup (if exists)
+                paper_backup_file = Path(__file__).parent / "trade_history_paper_backup.json"
+                if paper_backup_file.exists():
+                    with open(paper_backup_file, 'r') as f:
+                        paper_trades = json.load(f)
+                    with open(self.TRADE_HISTORY_FILE, 'w') as f:
+                        json.dump(paper_trades, f, indent=2)
+                    logger.info(f"📥 Restored {len(paper_trades)} paper trades from backup")
+                else:
+                    # No paper backup - start fresh
+                    with open(self.TRADE_HISTORY_FILE, 'w') as f:
+                        json.dump([], f)
+                    logger.info("🗑️ No paper backup found - starting fresh")
                 
-                # 3. Clear AI decisions
+                # 4. Clear AI decisions
                 ai_file = Path(__file__).parent / "ai_decisions.json"
                 with open(ai_file, 'w') as f:
                     json.dump([], f)
                 logger.info("🗑️ Cleared AI decisions")
                 
-                # 4. Reset config to paper trading defaults
-                paper_config = {
-                    'symbol': self.SYMBOL,
-                    'balance': 10000.0,
-                    'initial_balance': 10000.0,
-                    'peak_balance': 10000.0,
-                    'consecutive_wins': 0,
-                    'consecutive_losses': 0,
-                    'stats': {
-                        'total_trades': 0,
-                        'winning_trades': 0,
-                        'losing_trades': 0,
-                        'total_pnl': 0.0,
-                        'today_pnl': 0.0,
-                        'max_win': 0.0,
-                        'max_loss': 0.0
-                    },
-                    'open_position': None,
-                    'multi_positions': {},
-                    'position_slots': {},
-                    'prefilter_stats': {},
-                    'equity_curve': [],
-                    'trading_mode': 'paper',
-                    'last_updated': datetime.now(timezone.utc).isoformat()
-                }
+                # 5. Restore paper config from backup OR reset to defaults
+                paper_config_backup = Path(__file__).parent / "julaba_config_paper_backup.json"
+                if paper_config_backup.exists():
+                    with open(paper_config_backup, 'r') as f:
+                        paper_config = json.load(f)
+                    paper_config['trading_mode'] = 'paper'
+                    paper_config['last_updated'] = datetime.now(timezone.utc).isoformat()
+                    logger.info(f"📥 Restored paper config - Balance: ${paper_config.get('balance', 10000):,.2f}")
+                else:
+                    # No paper config backup - use defaults
+                    paper_config = {
+                        'symbol': self.SYMBOL,
+                        'balance': 10000.0,
+                        'initial_balance': 10000.0,
+                        'peak_balance': 10000.0,
+                        'balance_protection': 1000,  # Paper mode protection
+                        'consecutive_wins': 0,
+                        'consecutive_losses': 0,
+                        'stats': {
+                            'total_trades': 0,
+                            'winning_trades': 0,
+                            'losing_trades': 0,
+                            'total_pnl': 0.0,
+                            'today_pnl': 0.0,
+                            'max_win': 0.0,
+                            'max_loss': 0.0
+                        },
+                        'open_position': None,
+                        'multi_positions': {},
+                        'position_slots': {},
+                        'prefilter_stats': {},
+                        'equity_curve': [],
+                        'trading_mode': 'paper',
+                        'last_updated': datetime.now(timezone.utc).isoformat()
+                    }
+                    logger.info("💾 No paper config backup - using defaults ($10,000)")
+                
                 with open(self.CONFIG_FILE, 'w') as f:
                     json.dump(paper_config, f, indent=2)
-                logger.info("💾 Reset config to paper trading defaults ($10,000)")
                 
                 # 5. Save state and restart without --live flag
                 self._save_trading_state()
@@ -7043,7 +7153,18 @@ Keep response under 150 words. Be direct and actionable."""
                 # === SWITCH TO LIVE MODE ===
                 logger.info("🔄 SWITCHING TO LIVE TRADING MODE")
                 
-                # 1. Backup paper trade history
+                # 1. Backup paper config BEFORE switching
+                paper_config_backup = Path(__file__).parent / "julaba_config_paper_backup.json"
+                if self.CONFIG_FILE.exists():
+                    with open(self.CONFIG_FILE, 'r') as f:
+                        current_config = json.load(f)
+                    # Only backup if it looks like paper data
+                    if current_config.get('trading_mode') == 'paper' or current_config.get('balance', 0) >= 1000:
+                        with open(paper_config_backup, 'w') as f:
+                            json.dump(current_config, f, indent=2)
+                        logger.info(f"💾 Backed up paper config - Balance: ${current_config.get('balance', 0):,.2f}")
+                
+                # 2. Backup paper trade history
                 paper_backup_file = Path(__file__).parent / "trade_history_paper_backup.json"
                 if self.TRADE_HISTORY_FILE.exists():
                     with open(self.TRADE_HISTORY_FILE, 'r') as f:
@@ -7053,7 +7174,7 @@ Keep response under 150 words. Be direct and actionable."""
                             json.dump(paper_trades, f, indent=2)
                         logger.info(f"💾 Backed up {len(paper_trades)} paper trades")
                 
-                # 2. Restore live trade history from backup
+                # 3. Restore live trade history from backup
                 live_backup_file = Path(__file__).parent / "trade_history_live_backup.json"
                 if live_backup_file.exists():
                     with open(live_backup_file, 'r') as f:
@@ -7067,18 +7188,21 @@ Keep response under 150 words. Be direct and actionable."""
                         json.dump([], f)
                     logger.info("📝 No live backup found - starting fresh")
                 
-                # 3. Restore live config from backup
+                # 4. Restore live config from backup
                 live_config_backup = Path(__file__).parent / "julaba_config_live_backup.json"
                 if live_config_backup.exists():
                     with open(live_config_backup, 'r') as f:
                         config = json.load(f)
-                    logger.info(f"📥 Restored live config - Balance: ${config.get('balance', 0):,.2f}")
+                    logger.info(f"📥 Restored live config - Balance: ${config.get('balance', 0):,.2f}, Protection: ${config.get('balance_protection', 50):,.2f}")
                 else:
                     # No config backup - use current config but mark as live
                     config = {}
                     if self.CONFIG_FILE.exists():
                         with open(self.CONFIG_FILE, 'r') as f:
                             config = json.load(f)
+                    # Set reasonable defaults for live mode
+                    if 'balance_protection' not in config:
+                        config['balance_protection'] = 50  # Default $50 protection
                     logger.info("📝 No live config backup - using current values")
                 
                 # 4. Update config to mark as live mode
@@ -8196,6 +8320,31 @@ Keep response under 150 words. Be direct and actionable."""
             logger.info(f"📋 Setting position SL/TP for {futures_symbol} ({side.upper()})")
             logger.info(f"   Entry: ${entry_price:.6f} | SL: ${stop_loss:.6f} | TP1: ${tp1:.6f}")
             
+            # === CRITICAL: Validate SL/TP prices against current market ===
+            # Bybit rejects SL if it's not clearly on the correct side of current price
+            # Get current market price and add safety buffer
+            try:
+                ticker = await self.exchange.fetch_ticker(futures_symbol)
+                current_price = ticker['last']
+                
+                # Safety buffer: SL must be clearly below/above current price
+                safety_buffer = current_price * 0.002  # 0.2% buffer
+                
+                if side == "long":
+                    # For LONG: SL must be BELOW current price
+                    if stop_loss >= current_price - safety_buffer:
+                        old_sl = stop_loss
+                        stop_loss = current_price - safety_buffer
+                        logger.warning(f"   ⚠️ SL adjusted for safety: ${old_sl:.6f} → ${stop_loss:.6f} (current: ${current_price:.6f})")
+                else:
+                    # For SHORT: SL must be ABOVE current price
+                    if stop_loss <= current_price + safety_buffer:
+                        old_sl = stop_loss
+                        stop_loss = current_price + safety_buffer
+                        logger.warning(f"   ⚠️ SL adjusted for safety: ${old_sl:.6f} → ${stop_loss:.6f} (current: ${current_price:.6f})")
+            except Exception as e:
+                logger.warning(f"   ⚠️ Could not validate SL against market: {e}")
+            
             # === USE BYBIT'S POSITION TRADING-STOP API ===
             # This sets SL/TP on the POSITION level, which is the proper way for Bybit
             try:
@@ -8396,12 +8545,23 @@ Keep response under 150 words. Be direct and actionable."""
                 market_info = self._market_cache.get(futures_symbol, {})
                 limits = market_info.get('limits', {}).get('amount', {})
                 min_amount = limits.get('min', 0.001)  # Default fallback
-                precision = market_info.get('precision', {}).get('amount', 8)
+                precision = market_info.get('precision', {}).get('amount', 2)  # Default to 2 decimals
                 
                 # Round size to exchange precision
+                # precision can be:
+                # - integer (e.g., 2 = 2 decimal places)
+                # - float representing step size (e.g., 0.01 = 2 decimal places)
                 import math
-                if isinstance(precision, int):
+                if isinstance(precision, int) and precision > 0:
+                    # Integer precision = number of decimal places
                     size = math.floor(size * (10 ** precision)) / (10 ** precision)
+                elif isinstance(precision, (int, float)) and precision < 1 and precision > 0:
+                    # Decimal step size (e.g., 0.01 = 2 decimals)
+                    decimal_places = max(0, int(-math.log10(precision)))
+                    size = math.floor(size * (10 ** decimal_places)) / (10 ** decimal_places)
+                else:
+                    # Fallback: round to 2 decimal places (safe for most coins)
+                    size = math.floor(size * 100) / 100
                 
                 # Check minimum order amount AND ensure size is positive
                 if size <= 0:
@@ -8979,10 +9139,20 @@ Keep response under 150 words. Be direct and actionable."""
         
         # Start Telegram bot FIRST (so it's available even if exchange connection fails)
         if self.telegram.enabled:
-            try:
-                await self.telegram.start()
-            except Exception as tg_err:
-                logger.warning(f"⚠️ Telegram start failed (will retry): {tg_err}")
+            telegram_started = False
+            for attempt in range(3):
+                try:
+                    await self.telegram.start()
+                    telegram_started = True
+                    logger.info("✅ Telegram bot started successfully")
+                    break
+                except Exception as tg_err:
+                    logger.warning(f"⚠️ Telegram start failed (attempt {attempt+1}/3): {tg_err}")
+                    if attempt < 2:
+                        await asyncio.sleep(3)
+            
+            if not telegram_started:
+                logger.error("❌ Telegram bot failed to start after 3 attempts - continuing without telegram")
         
         # Connect to exchange
         await self.connect()
@@ -9026,17 +9196,37 @@ Keep response under 150 words. Be direct and actionable."""
                 await self.ws_price_stream.start()
                 logger.info(f"🔌 WebSocket PRICE stream started for {len(symbols_to_watch)} symbols")
                 
-                # === POSITION WEBSOCKET (currently disabled to avoid rate limits) ===
-                # The price WebSocket provides real-time updates for TP/SL execution
-                # Position detection uses fast polling (2s) instead to stay within API limits
-                # Uncomment below to enable when Bybit rate limits are relaxed:
-                # self.ws_position_stream.register_callback(self._on_realtime_position_update)
-                # await self.ws_position_stream.start()
-                # logger.info(f"🔌 WebSocket POSITION stream started - instant sync enabled")
+                # === POSITION WEBSOCKET FOR REAL-TIME RECOVERY TRACKING ===
+                # ENABLED for instant loss monitoring and fast AI recovery triggers
+                # Monitors position PnL in real-time (like peak tracking but for losses)
+                try:
+                    # Check if ws_position_stream exists (created in __init__)
+                    if hasattr(self, 'ws_position_stream'):
+                        # Register recovery monitoring callback
+                        self.ws_position_stream.register_callback(self._on_position_update_recovery)
+                        await self.ws_position_stream.start()
+                        logger.info(f"🔌 WebSocket POSITION stream started - REAL-TIME RECOVERY TRACKING enabled")
+                except Exception as pos_ws_err:
+                    logger.warning(f"⚠️ Position WebSocket failed (recovery tracking uses polling): {pos_ws_err}")
                 
             except Exception as ws_err:
                 logger.warning(f"⚠️ WebSocket failed to start (using polling fallback): {ws_err}")
                 self.ws_enabled = False
+        
+        # === START NEWS MONITOR BACKGROUND TASK ===
+        try:
+            from news_monitor import NewsMonitor
+            self.news_monitor = NewsMonitor()
+            # NOTE: NOT setting Telegram callback - user prefers /news command only
+            # No auto-alerts, just background data collection for /news command
+            # Start background monitoring (120 second interval)
+            self._news_monitor_task = asyncio.create_task(
+                self.news_monitor.run_continuous_monitor(interval_seconds=120)
+            )
+            logger.info("📰 News monitor background task started (alerts disabled, use /news)")
+        except Exception as news_err:
+            logger.warning(f"⚠️ News monitor failed to start: {news_err}")
+            self.news_monitor = None
         
         # Set start time now (after warmup complete)
         self.start_time = datetime.now(timezone.utc)
@@ -9241,6 +9431,16 @@ Keep response under 150 words. Be direct and actionable."""
         await self._check_daily_loss_limit()
         if self.daily_loss_triggered:
             return  # Stop trading for the day
+        
+        # === WEEKLY LOSS LIMIT CHECK (Circuit Breaker) ===
+        await self._check_weekly_loss_limit()
+        if self.weekly_loss_triggered:
+            return  # Stop trading for the week
+        
+        # === MAX DRAWDOWN CHECK (Ultimate Circuit Breaker) ===
+        await self._check_max_drawdown()
+        if self.max_drawdown_triggered:
+            return  # Trading halted until manual reset
         
         # === REGIME-AWARE SIGNAL GENERATION ===
         # Use regime-aware signals that switch between trend-following and mean-reversion
@@ -9471,7 +9671,14 @@ Keep response under 150 words. Be direct and actionable."""
                     'tp2_hit': tp2_hit,
                     # Peak profit tracking for intelligent reversal detection
                     'peak_profit_usd': getattr(pos, 'peak_profit_usd', 0),
-                    'peak_profit_pct': getattr(pos, 'peak_profit_pct', 0)
+                    'peak_profit_pct': getattr(pos, 'peak_profit_pct', 0),
+                    'deepest_loss_pct': getattr(pos, 'deepest_loss_pct', 0),
+                    'deepest_loss_usd': getattr(pos, 'deepest_loss_usd', 0),
+                    'recovery_attempts': getattr(pos, 'recovery_attempts', 0),
+                    'in_recovery_mode': getattr(pos, 'in_recovery_mode', False),
+                    # CRITICAL: Include open_time for new position detection
+                    'open_time': getattr(pos, 'opened_at', None),
+                    'entry_time': getattr(pos, 'opened_at', None)
                 }
                 
                 # CRITICAL: Fetch correct bars for THIS symbol, not just main symbol
@@ -9537,6 +9744,13 @@ Keep response under 150 words. Be direct and actionable."""
                         logger.info(f"📊 {symbol}: Reversal Score={reversal_score:.0f}/100 | Drawdown={drawdown_pct:.0f}% from peak")
                 
                 logger.info(f"🧠 UNIFIED: {symbol} {position_side} | Action: {action.upper()} | Conf: {confidence:.0%} | PnL: {unrealized_pnl_pct:+.2f}%")
+                
+                # Handle recovery mode
+                if action == 'hold_recovery':
+                    recovery_score = unified.get('recovery_score', 0)
+                    logger.info(f"🔄 RECOVERY MODE: {symbol} holding for recovery | Score: {recovery_score}/100 | Reasoning: {reasoning}")
+                    # Position will be held - return without closing
+                    return
                 
                 # Handle SL tightening
                 if action == 'tighten_sl' and unified.get('sl_adjustment') and self.ai_mode == 'autonomous':
@@ -10141,6 +10355,62 @@ _Technical signal filtered by AI_"""
                         f"_Trading halted until tomorrow._\n"
                         f"Use `/reset daily_loss` to override."
                     )
+    
+    async def _check_weekly_loss_limit(self):
+        """Check and enforce weekly loss limit (circuit breaker)."""
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        current_week = now.isocalendar()[1]  # ISO week number
+        
+        # Reset circuit breaker on new week (Monday)
+        if self.weekly_loss_reset_week != current_week:
+            self.weekly_loss_reset_week = current_week
+            self.weekly_pnl = 0.0  # Reset weekly P&L tracking
+            if self.weekly_loss_triggered:
+                logger.info("🔄 Weekly loss circuit breaker reset (new week)")
+                self.weekly_loss_triggered = False
+                if self.telegram.enabled:
+                    await self.telegram.send_message("🔄 *Weekly Loss Limit Reset*\nTrading resumed for new week.")
+        
+        # Track weekly P&L (add today's to cumulative)
+        # Note: This is simplified - for accuracy, should sum all trades in the week
+        weekly_loss_pct = abs(self.weekly_pnl) / max(self.balance, self.initial_balance) if self.weekly_pnl < 0 else 0
+        
+        if weekly_loss_pct >= self.weekly_loss_limit and not self.weekly_loss_triggered:
+            self.weekly_loss_triggered = True
+            logger.warning(f"🛑 WEEKLY LOSS LIMIT HIT: {weekly_loss_pct*100:.1f}% (limit: {self.weekly_loss_limit*100:.1f}%)")
+            logger.warning("Trading halted until next week!")
+            
+            if self.telegram.enabled:
+                await self.telegram.send_message(
+                    f"🛑 *WEEKLY LOSS LIMIT TRIGGERED*\n\n"
+                    f"Weekly Loss: `${self.weekly_pnl:.2f}` ({weekly_loss_pct*100:.1f}%)\n"
+                    f"Limit: `{self.weekly_loss_limit*100:.1f}%`\n\n"
+                    f"_Trading halted until next week._"
+                )
+    
+    async def _check_max_drawdown(self):
+        """Check and enforce max drawdown circuit breaker (ultimate safety)."""
+        if self.peak_balance <= 0:
+            return
+        
+        drawdown_pct = (self.peak_balance - self.balance) / self.peak_balance
+        
+        if drawdown_pct >= self.max_drawdown_limit and not self.max_drawdown_triggered:
+            self.max_drawdown_triggered = True
+            logger.critical(f"🚨 MAX DRAWDOWN CIRCUIT BREAKER: {drawdown_pct*100:.1f}% drawdown from peak ${self.peak_balance:.2f}")
+            logger.critical("TRADING HALTED - Manual intervention required!")
+            
+            if self.telegram.enabled:
+                await self.telegram.send_message(
+                    f"🚨 *CRITICAL: MAX DRAWDOWN TRIGGERED*\n\n"
+                    f"Current Drawdown: `{drawdown_pct*100:.1f}%`\n"
+                    f"Peak Balance: `${self.peak_balance:.2f}`\n"
+                    f"Current Balance: `${self.balance:.2f}`\n"
+                    f"Limit: `{self.max_drawdown_limit*100:.1f}%`\n\n"
+                    f"_⚠️ TRADING HALTED - Manual review required!_\n"
+                    f"Use `/reset drawdown` to resume after review."
+                )
     
     async def _send_periodic_summary(self):
         """Send a periodic status summary."""
@@ -11398,86 +11668,330 @@ _Auto-update every 4 hours_
         return validation
 
     async def _get_regime_adaptive_tp_levels(self, entry_price: float, stop_loss: float,
-                                            df: pd.DataFrame) -> Dict[str, float]:
+                                            df: pd.DataFrame, side: str = 'long') -> Dict[str, float]:
         """
-        Calculate take profit levels based on market regime.
+        INTELLIGENT TP SYSTEM - Multi-factor analysis for optimal profit targets.
         
-        TRENDING (Hurst > 0.6):
-          - TP1: 1.5R, TP2: 2.5R, TP3: 4.0R
-        
-        MEAN-REVERTING (Hurst < 0.4):
-          - TP1: 0.8R, TP2: 1.2R, TP3: 1.8R
-        
-        VOLATILE regime:
-          - All reduced 20%
+        Factors considered:
+        1. Market regime (trending vs mean-reverting)
+        2. Support/Resistance levels (place TPs before key levels)
+        3. Recent swing highs/lows (realistic targets)
+        4. ATR-normalized volatility (adjust for market conditions)
+        5. Volume profile (where is liquidity?)
+        6. Momentum strength (let winners run in strong trends)
         """
         from indicator import calculate_regime_hmm, calculate_garch_volatility
+        import numpy as np
         
         # Calculate R-value
         r_value = abs(entry_price - stop_loss)
+        is_long = side.lower() == 'long'
         
-        # Default levels
-        tp1_mult = 1.5
-        tp2_mult = 2.5
-        tp3_mult = 4.0
+        # Default levels from adaptive params
+        tp1_mult = float(self.adaptive_params.get('tp1_r', {}).get('current', 1.0))
+        tp2_mult = float(self.adaptive_params.get('tp2_r', {}).get('current', 1.5))
+        tp3_mult = tp2_mult * 1.8  # TP3 ~80% further than TP2
+        
+        adjustments = []
         
         try:
-            # Get regime
+            if len(df) < 20:
+                logger.debug("Insufficient data for smart TPs, using defaults")
+                return self._calculate_tp_output(entry_price, r_value, tp1_mult, tp2_mult, tp3_mult, is_long, adjustments)
+            
+            # === 1. SUPPORT/RESISTANCE ANALYSIS ===
+            # Find key levels that might act as barriers
+            highs = df['high'].rolling(10).max()
+            lows = df['low'].rolling(10).min()
+            
+            recent_high = float(df['high'].iloc[-20:].max())
+            recent_low = float(df['low'].iloc[-20:].min())
+            swing_range = recent_high - recent_low
+            
+            # Find pivot levels (local highs/lows)
+            pivot_highs = []
+            pivot_lows = []
+            for i in range(5, len(df) - 2):
+                if df['high'].iloc[i] == df['high'].iloc[i-5:i+3].max():
+                    pivot_highs.append(float(df['high'].iloc[i]))
+                if df['low'].iloc[i] == df['low'].iloc[i-5:i+3].min():
+                    pivot_lows.append(float(df['low'].iloc[i]))
+            
+            # Sort and filter relevant levels
+            if is_long:
+                # For longs, we care about resistance above
+                relevant_levels = [p for p in pivot_highs if p > entry_price]
+                relevant_levels = sorted(relevant_levels)[:3]  # Top 3 nearest resistance
+            else:
+                # For shorts, we care about support below
+                relevant_levels = [p for p in pivot_lows if p < entry_price]
+                relevant_levels = sorted(relevant_levels, reverse=True)[:3]  # Top 3 nearest support
+            
+            # Adjust TPs if they clash with S/R levels
+            if relevant_levels:
+                nearest_level = relevant_levels[0]
+                level_distance = abs(nearest_level - entry_price)
+                level_distance_r = level_distance / r_value if r_value > 0 else 1.0
+                
+                # If nearest resistance/support is very close, be conservative with TP1
+                if level_distance_r < tp1_mult * 0.9:
+                    # Place TP1 just before the level (90% of distance)
+                    tp1_mult = min(tp1_mult, level_distance_r * 0.9)
+                    adjustments.append(f"TP1 adjusted to {tp1_mult:.1f}R (S/R at {level_distance_r:.1f}R)")
+                
+                # Adjust TP2/TP3 based on next levels
+                if len(relevant_levels) >= 2:
+                    second_level_dist = abs(relevant_levels[1] - entry_price) / r_value if r_value > 0 else tp2_mult
+                    if second_level_dist < tp2_mult * 0.9:
+                        tp2_mult = min(tp2_mult, second_level_dist * 0.9)
+                        adjustments.append(f"TP2 adjusted for S/R")
+            
+            # === 2. RECENT SWING ANALYSIS ===
+            # What have been realistic price moves recently?
+            recent_moves = []
+            for i in range(max(0, len(df) - 30), len(df) - 1):
+                move = abs(df['close'].iloc[i+1] - df['close'].iloc[i]) / df['close'].iloc[i]
+                recent_moves.append(move)
+            
+            if recent_moves:
+                avg_move = np.mean(recent_moves)
+                max_move = max(recent_moves)
+                
+                # Convert to R-multiples
+                avg_move_r = (avg_move * entry_price) / r_value if r_value > 0 else 1.0
+                max_move_r = (max_move * entry_price) / r_value if r_value > 0 else 2.0
+                
+                # If typical moves are small, don't expect huge TPs
+                if avg_move_r < 0.3 and tp1_mult > 0.8:
+                    tp1_mult = min(tp1_mult, 0.8)
+                    adjustments.append(f"TP1 reduced for low volatility (avg {avg_move_r:.2f}R)")
+            
+            # === 3. REGIME ANALYSIS ===
             returns = df['close'].pct_change().dropna()
-            if len(returns) < 10:
-                logger.debug("Insufficient data for regime-adaptive TPs, using defaults")
-                return {
-                    'tp1': entry_price + (r_value * tp1_mult),
-                    'tp2': entry_price + (r_value * tp2_mult),
-                    'tp3': entry_price + (r_value * tp3_mult),
-                    'tp1_mult': tp1_mult,
-                    'tp2_mult': tp2_mult,
-                    'tp3_mult': tp3_mult
-                }
-            
-            regime_result = calculate_regime_hmm(returns, n_regimes=3)
-            
-            if regime_result.get('status') == 'success':
-                regime = regime_result.get('regime', 'NORMAL')
+            if len(returns) >= 10:
+                regime_result = calculate_regime_hmm(returns, n_regimes=3)
                 
-                # Adjust multipliers based on regime
-                if regime == 'CALM':
-                    # Mean-reverting: take profits faster
-                    tp1_mult, tp2_mult, tp3_mult = 0.8, 1.2, 1.8
-                    logger.info(f"📊 Regime CALM (mean-reverting): Using aggressive TPs {tp1_mult}/{tp2_mult}/{tp3_mult}")
-                elif regime == 'VOLATILE':
-                    # Reduce all by 20% in volatile
-                    tp1_mult *= 0.8
-                    tp2_mult *= 0.8
-                    tp3_mult *= 0.8
-                    logger.info(f"📊 Regime VOLATILE: Reducing TPs by 20%")
-                # NORMAL: use defaults
+                if regime_result.get('status') == 'success':
+                    regime = regime_result.get('regime', 'NORMAL')
+                    
+                    if regime == 'CALM':
+                        # Mean-reverting: take profits faster
+                        tp1_mult *= 0.85
+                        tp2_mult *= 0.85
+                        tp3_mult *= 0.85
+                        adjustments.append(f"Regime CALM: -15%")
+                    elif regime == 'VOLATILE':
+                        # Volatile: wider TPs (let it run)
+                        tp1_mult *= 1.1
+                        tp2_mult *= 1.1
+                        tp3_mult *= 1.1
+                        adjustments.append(f"Regime VOLATILE: +10%")
+                    # NORMAL: no adjustment
             
-            # Further adjust if volatility spiking
-            vol_result = calculate_garch_volatility(returns)
-            if vol_result.get('status') == 'success':
-                vol_trend = vol_result.get('vol_trend', '')
-                vol_change = vol_result.get('vol_change_pct', 0)
-                
-                if vol_trend == 'increasing' and vol_change > 10:
-                    # Vol spiking: take profits even faster
-                    tp1_mult *= 0.85
-                    tp2_mult *= 0.85
-                    tp3_mult *= 0.85
-                    logger.info(f"📊 Volatility spiking ({vol_change:+.1f}%): Further reducing TPs by 15%")
-        
+            # === 4. VOLATILITY TREND ===
+            if len(returns) >= 10:
+                vol_result = calculate_garch_volatility(returns)
+                if vol_result.get('status') == 'success':
+                    vol_trend = vol_result.get('vol_trend', '')
+                    vol_change = vol_result.get('vol_change_pct', 0)
+                    
+                    if vol_trend == 'increasing' and vol_change > 15:
+                        # Vol expanding: widen TPs
+                        tp1_mult *= 1.1
+                        tp2_mult *= 1.15
+                        tp3_mult *= 1.2
+                        adjustments.append(f"Vol expanding +{vol_change:.0f}%: wider TPs")
+                    elif vol_trend == 'decreasing' and vol_change < -15:
+                        # Vol contracting: tighter TPs
+                        tp1_mult *= 0.9
+                        tp2_mult *= 0.85
+                        tp3_mult *= 0.8
+                        adjustments.append(f"Vol contracting {vol_change:.0f}%: tighter TPs")
+            
+            # === 5. MOMENTUM STRENGTH ===
+            # If momentum is strong in our direction, let it run
+            rsi = self._calculate_rsi(df['close'], 14)
+            momentum_5 = (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100 if len(df) >= 5 else 0
+            
+            strong_momentum = False
+            if is_long:
+                strong_momentum = rsi > 55 and momentum_5 > 1.0
+            else:
+                strong_momentum = rsi < 45 and momentum_5 < -1.0
+            
+            if strong_momentum:
+                # Strong momentum: widen TP2 and TP3 to let winners run
+                tp2_mult *= 1.15
+                tp3_mult *= 1.25
+                adjustments.append(f"Strong momentum: wider TP2/TP3")
+            
+            # === 6. ENSURE MINIMUM SPACING ===
+            # TP1 should be at least 0.5R, TP2 at least 1.0R, TP3 at least 1.5R
+            tp1_mult = max(tp1_mult, 0.5)
+            tp2_mult = max(tp2_mult, tp1_mult + 0.3)  # At least 0.3R more than TP1
+            tp3_mult = max(tp3_mult, tp2_mult + 0.5)  # At least 0.5R more than TP2
+            
+            # === 7. CAP MAXIMUM VALUES ===
+            # Don't set unrealistic targets
+            tp1_mult = min(tp1_mult, 1.5)
+            tp2_mult = min(tp2_mult, 3.0)
+            tp3_mult = min(tp3_mult, 5.0)
+            
         except Exception as e:
-            logger.warning(f"Regime-adaptive TP error: {e} - using defaults")
+            logger.warning(f"Smart TP error: {e} - using defaults")
+            adjustments.append(f"Error: {str(e)[:30]}")
         
-        # Calculate final levels
-        return {
-            'tp1': entry_price + (r_value * tp1_mult),
-            'tp2': entry_price + (r_value * tp2_mult),
-            'tp3': entry_price + (r_value * tp3_mult),
-            'tp1_mult': tp1_mult,
-            'tp2_mult': tp2_mult,
-            'tp3_mult': tp3_mult
-        }
+        if adjustments:
+            logger.info(f"🎯 Smart TP adjustments: {'; '.join(adjustments)}")
+        
+        return self._calculate_tp_output(entry_price, r_value, tp1_mult, tp2_mult, tp3_mult, is_long, adjustments)
+    
+    def _calculate_tp_output(self, entry_price: float, r_value: float, 
+                            tp1_mult: float, tp2_mult: float, tp3_mult: float,
+                            is_long: bool, adjustments: list) -> Dict[str, float]:
+        """Calculate final TP values."""
+        if is_long:
+            return {
+                'tp1': entry_price + (r_value * tp1_mult),
+                'tp2': entry_price + (r_value * tp2_mult),
+                'tp3': entry_price + (r_value * tp3_mult),
+                'tp1_mult': tp1_mult,
+                'tp2_mult': tp2_mult,
+                'tp3_mult': tp3_mult,
+                'adjustments': adjustments
+            }
+        else:
+            return {
+                'tp1': entry_price - (r_value * tp1_mult),
+                'tp2': entry_price - (r_value * tp2_mult),
+                'tp3': entry_price - (r_value * tp3_mult),
+                'tp1_mult': tp1_mult,
+                'tp2_mult': tp2_mult,
+                'tp3_mult': tp3_mult,
+                'adjustments': adjustments
+            }
+    
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
+        """Calculate RSI for TP analysis."""
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+        except:
+            return 50.0
+
+    async def _get_momentum_trail_offset(self, current_price: float, entry_price: float, 
+                                         side: str, r_value: float) -> float:
+        """
+        MOMENTUM-AWARE TRAILING STOP - Adapts trail tightness based on momentum.
+        
+        Logic:
+        - STRONG momentum in our favor → WIDER trail (let it run)
+        - WEAK/FADING momentum → TIGHTER trail (protect profit)
+        - COUNTER momentum → VERY TIGHT trail (exit soon)
+        
+        Returns: Trail offset as R-multiple (e.g., 0.5R, 0.3R, 0.8R)
+        """
+        import numpy as np
+        
+        # Default offset from params
+        base_offset = self.TRAIL_OFFSET_R
+        
+        try:
+            if not hasattr(self, 'bars_agg') or len(self.bars_agg) < 10:
+                return base_offset
+            
+            df = pd.DataFrame(self.bars_agg)
+            if len(df) < 10:
+                return base_offset
+            
+            is_long = side.lower() == 'long'
+            
+            # Calculate momentum metrics
+            prices = df['close'].values
+            
+            # 1. Short-term momentum (last 3 candles)
+            momentum_3 = (prices[-1] - prices[-4]) / prices[-4] * 100 if len(prices) >= 4 else 0
+            
+            # 2. Medium-term momentum (last 5 candles)
+            momentum_5 = (prices[-1] - prices[-6]) / prices[-6] * 100 if len(prices) >= 6 else 0
+            
+            # 3. RSI
+            rsi = self._calculate_rsi(df['close'], 14)
+            
+            # 4. Price vs SMA
+            sma_20 = df['close'].rolling(20).mean().iloc[-1] if len(df) >= 20 else prices[-1]
+            price_vs_sma = ((prices[-1] - sma_20) / sma_20) * 100
+            
+            # 5. Current profit %
+            if is_long:
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            else:
+                pnl_pct = ((entry_price - current_price) / entry_price) * 100
+            
+            # === MOMENTUM SCORING ===
+            # Positive = momentum in our favor, Negative = momentum against us
+            if is_long:
+                momentum_score = (
+                    (momentum_3 * 2) +  # Weight short-term more
+                    (momentum_5 * 1) +
+                    ((rsi - 50) * 0.1) +  # RSI contribution
+                    (price_vs_sma * 0.5)  # Above SMA = good for long
+                )
+            else:
+                momentum_score = (
+                    (-momentum_3 * 2) +  # Inverse for short
+                    (-momentum_5 * 1) +
+                    ((50 - rsi) * 0.1) +  # Low RSI good for short
+                    (-price_vs_sma * 0.5)  # Below SMA = good for short
+                )
+            
+            # === ADAPTIVE TRAIL OFFSET ===
+            # Strong positive momentum → wider trail (let it run)
+            # Negative momentum → tighter trail (protect profit)
+            
+            if momentum_score > 3.0:
+                # STRONG momentum in our favor - give it room
+                trail_mult = 1.3  # 30% wider
+            elif momentum_score > 1.5:
+                # Moderate momentum - normal trail
+                trail_mult = 1.0
+            elif momentum_score > 0:
+                # Weak momentum - slightly tighter
+                trail_mult = 0.85
+            elif momentum_score > -1.5:
+                # Slightly against us - tighter trail
+                trail_mult = 0.7
+            else:
+                # Strong momentum against - very tight
+                trail_mult = 0.5
+            
+            # === PROFIT-BASED ADJUSTMENT ===
+            # The more profit we have, the tighter we should trail to protect it
+            if pnl_pct > 2.0:
+                trail_mult *= 0.85  # 15% tighter for large profits
+            elif pnl_pct > 1.0:
+                trail_mult *= 0.9   # 10% tighter for decent profits
+            
+            # Calculate final offset
+            final_offset = base_offset * trail_mult
+            
+            # Enforce bounds (0.3R to 1.0R)
+            final_offset = max(0.3, min(1.0, final_offset))
+            
+            # Log significant changes
+            if abs(final_offset - base_offset) > 0.1:
+                logger.debug(f"📐 Trail offset adjusted: {base_offset:.2f}R → {final_offset:.2f}R "
+                           f"(momentum_score={momentum_score:.1f}, pnl={pnl_pct:.1f}%)")
+            
+            return final_offset
+            
+        except Exception as e:
+            logger.debug(f"Momentum trail calculation error: {e}")
+            return base_offset
 
     async def _validate_pair_switch_math(self, current_score: float, target_score: float,
                                         current_symbol: str, target_symbol: str,
@@ -11618,6 +12132,40 @@ _Auto-update every 4 hours_
                     logger.info(f"🤖 AI POWER: Adjusting risk by {size_mult:.1f}x → {risk_pct:.2%}")
             
             logger.info(f"🚀 _open_position_for_symbol CALLED: {side.upper()} {symbol} @ ${price:.4f} | live_mode={self.live_mode} | source={source}")
+            
+            # === FINAL S/R VALIDATION (LAST LINE OF DEFENSE) ===
+            # This is the FINAL CHECK before opening - prevents entering at resistance/support
+            # Even if scanner passed, market may have moved - check again at execution time
+            try:
+                if df is not None and len(df) >= 50:
+                    sr_levels = self.ai_filter._detect_resistance_support_levels(df, price)
+                    pos_range = sr_levels.get('position_in_range_pct', 50)
+                    in_r_zone = sr_levels.get('in_resistance_zone', False)
+                    in_s_zone = sr_levels.get('in_support_zone', False)
+                    r_touches = sr_levels.get('resistance_touches', 0)
+                    s_touches = sr_levels.get('support_touches', 0)
+                    
+                    # BLOCK LONG at resistance
+                    if side == "long":
+                        if in_r_zone and r_touches >= 3:
+                            logger.error(f"🚫 FINAL BLOCK: LONG {symbol} - IN RESISTANCE ZONE with {r_touches} rejections @ ${price:.4f}")
+                            return
+                        if pos_range >= 88:
+                            logger.error(f"🚫 FINAL BLOCK: LONG {symbol} - TOO CLOSE TO RESISTANCE ({pos_range:.0f}% >= 88%) @ ${price:.4f}")
+                            return
+                    
+                    # BLOCK SHORT at support
+                    if side == "short":
+                        if in_s_zone and s_touches >= 3:
+                            logger.error(f"🚫 FINAL BLOCK: SHORT {symbol} - IN SUPPORT ZONE with {s_touches} bounces @ ${price:.4f}")
+                            return
+                        if pos_range <= 12:
+                            logger.error(f"🚫 FINAL BLOCK: SHORT {symbol} - TOO CLOSE TO SUPPORT ({pos_range:.0f}% <= 12%) @ ${price:.4f}")
+                            return
+                    
+                    logger.info(f"✅ FINAL S/R CHECK PASSED: {symbol} {side.upper()} at {pos_range:.0f}% of range")
+            except Exception as sr_err:
+                logger.warning(f"⚠️ Final S/R check failed for {symbol}: {sr_err} (proceeding with caution)")
             
             # === CRITICAL: Check max positions BEFORE opening ===
             open_positions = [p for p in self.positions.values() if p is not None]
@@ -12127,19 +12675,14 @@ _Auto-update every 4 hours_
         
         # === GET REGIME-ADAPTIVE TP LEVELS ===
         r_value = risk_per_unit
-        tp_levels = await self._get_regime_adaptive_tp_levels(price, stop_loss, pd.DataFrame(self.bars_agg))
+        tp_levels = await self._get_regime_adaptive_tp_levels(price, stop_loss, pd.DataFrame(self.bars_agg), side)
         
-        if side == "long":
-            tp1 = tp_levels['tp1']
-            tp2 = tp_levels['tp2']
-            tp3 = tp_levels['tp3']
-        else:
-            # For short positions, flip the calculations
-            tp1 = price - (r_value * tp_levels['tp1_mult'])
-            tp2 = price - (r_value * tp_levels['tp2_mult'])
-            tp3 = price - (r_value * tp_levels['tp3_mult'])
+        # Use the pre-calculated values (function now handles both long/short)
+        tp1 = tp_levels['tp1']
+        tp2 = tp_levels['tp2']
+        tp3 = tp_levels['tp3']
         
-        logger.info(f"📊 TP levels (regime-adaptive): TP1: {tp1:.4f} ({tp_levels['tp1_mult']:.1f}R), "
+        logger.info(f"📊 Smart TP levels: TP1: {tp1:.4f} ({tp_levels['tp1_mult']:.1f}R), "
                     f"TP2: {tp2:.4f} ({tp_levels['tp2_mult']:.1f}R), TP3: {tp3:.4f} ({tp_levels['tp3_mult']:.1f}R)")
         
         # === REQUEST USER CONFIRMATION FOR BELOW-MINIMUM TRADES ===
@@ -12313,6 +12856,7 @@ _Auto-update every 4 hours_
             tp1=tp1,
             tp2=tp2,
             tp3=tp3,
+            original_r_value=abs(actual_entry_price - stop_loss),  # Store for trailing after BE
             entry_df_snapshot=entry_snapshot
         )
         
@@ -12644,16 +13188,43 @@ Reply in JSON:
                         await self._close_position("TP3 Hit (WebSocket)", price)
                 
                 # Update trailing stop if in profit and TP1 hit
+                # Using MOMENTUM-AWARE trailing that adapts to market conditions
                 if pos.tp1_hit and pos.trailing_stop:
-                    r_value = abs(pos.entry_price - pos.stop_loss)
+                    # FIXED: Use stored r_value instead of recalculating (was 0 after breakeven)
+                    r_value = pos.original_r_value if pos.original_r_value > 0 else abs(pos.entry_price - pos.stop_loss)
+                    
+                    # Get momentum-adjusted trail offset
+                    trail_offset = await self._get_momentum_trail_offset(
+                        price, pos.entry_price, pos.side, r_value
+                    )
+                    
                     if pos.side == "long":
-                        new_trail = price - (r_value * self.TRAIL_OFFSET_R)
+                        new_trail = price - (r_value * trail_offset)
                         if new_trail > pos.trailing_stop:
                             pos.trailing_stop = new_trail
                     else:
-                        new_trail = price + (r_value * self.TRAIL_OFFSET_R)
+                        new_trail = price + (r_value * trail_offset)
                         if new_trail < pos.trailing_stop:
                             pos.trailing_stop = new_trail
+                
+                # === REAL-TIME PEAK TRACKING (Primary Position) ===
+                # Track peak profit in real-time for intelligent reversal detection
+                entry_price = pos.entry_price
+                if pos.side == "long":
+                    pnl_pct = ((price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - price) / entry_price) * 100
+                
+                # Update peak if current profit is higher
+                current_peak_pct = getattr(pos, 'peak_profit_pct', 0)
+                if pnl_pct > current_peak_pct and pnl_pct > 0:
+                    pos.peak_profit_pct = pnl_pct
+                    # Estimate USD based on position value
+                    position_value = getattr(pos, 'size', 0) * entry_price
+                    pos.peak_profit_usd = pnl_pct * position_value / 100
+                    # Only log significant new peaks (>0.1% above previous)
+                    if pnl_pct > current_peak_pct + 0.05:
+                        logger.info(f"📈 {symbol}: RT NEW PEAK! {pnl_pct:.2f}% (${pos.peak_profit_usd:.2f})")
         
         # Check multi-positions (secondary positions)
         for sym, pos in list(self.positions.items()):
@@ -12714,6 +13285,25 @@ Reply in JSON:
                     else:
                         pos.trailing_stop = price + (r_value * 0.5)
                     logger.info(f"🟢 WEBSOCKET TP1 HIT (Multi): {sym} @ ${price:.4f}, SL→BE")
+            
+            # === REAL-TIME PEAK TRACKING (Multi-Position) ===
+            # Track peak profit in real-time for intelligent reversal detection
+            entry_price = pos.entry_price
+            if pos.side.lower() == "long":
+                pnl_pct = ((price - entry_price) / entry_price) * 100
+            else:
+                pnl_pct = ((entry_price - price) / entry_price) * 100
+            
+            # Update peak if current profit is higher
+            current_peak_pct = getattr(pos, 'peak_profit_pct', 0)
+            if pnl_pct > current_peak_pct and pnl_pct > 0:
+                pos.peak_profit_pct = pnl_pct
+                # Estimate USD based on position value
+                position_value = getattr(pos, 'size', 0) * entry_price
+                pos.peak_profit_usd = pnl_pct * position_value / 100
+                # Only log significant new peaks (>0.05% above previous)
+                if pnl_pct > current_peak_pct + 0.05:
+                    logger.info(f"📈 {sym}: RT NEW PEAK! {pnl_pct:.2f}% (${pos.peak_profit_usd:.2f})")
 
     # =====================================================================
     # WEBSOCKET REAL-TIME POSITION CALLBACK
@@ -13087,6 +13677,170 @@ Reply in JSON:
                 remaining_pct=remaining
             )
     
+    async def _on_position_update_recovery(self, symbol: str, position_data: dict, change_type: str):
+        """
+        Real-time recovery monitoring via WebSocket - INSTANT PnL tracking.
+        Called on EVERY position update (like peak tracking but for losses).
+        
+        Fast AI triggers:
+        - Loss deepens by 0.1% → Check recovery signals
+        - Loss hits -0.3% → AI validation
+        - Loss hits -0.5% → URGENT AI decision
+        """
+        try:
+            # Only monitor existing positions
+            if change_type == "CLOSED":
+                return
+            
+            # Find position object
+            pos = None
+            if self.position and self.position.symbol.replace('/', '') == symbol.replace('/', ''):
+                pos = self.position
+            elif symbol in self.positions:
+                pos = self.positions[symbol]
+            elif symbol.replace('/', '') in self.positions:
+                pos = self.positions[symbol.replace('/', '')]
+            
+            if not pos:
+                return
+            
+            # Calculate real-time PnL
+            current_price = float(position_data.get('markPrice', 0))
+            if current_price == 0:
+                return
+            
+            entry_price = pos.entry_price
+            side = pos.side
+            
+            # Calculate PnL %
+            if side == 'long':
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            else:
+                pnl_pct = ((entry_price - current_price) / entry_price) * 100
+            
+            pnl_usd = (current_price - entry_price) * pos.remaining_size if side == 'long' else \
+                      (entry_price - current_price) * pos.remaining_size
+            
+            # === TRACK LOSS DEPTH (like peak tracking but negative) ===
+            if pnl_pct < 0:  # Only track losses
+                # Update deepest loss if this is worse
+                if pnl_pct < pos.deepest_loss_pct:
+                    old_deepest = pos.deepest_loss_pct
+                    pos.deepest_loss_pct = pnl_pct
+                    pos.deepest_loss_usd = pnl_usd
+                    
+                    loss_deepened_by = abs(pnl_pct - old_deepest)
+                    
+                    logger.info(f"📉 {symbol}: Loss DEEPENED {loss_deepened_by:.2f}% | Now: {pnl_pct:.2f}% (${pnl_usd:.2f})")
+                    
+                    # === FAST AI TRIGGERS ===
+                    # Prevent spam: Only check recovery every 10 seconds
+                    now = datetime.utcnow()
+                    time_since_last_check = (now - pos.last_recovery_check).total_seconds()
+                    
+                    if time_since_last_check < 10:
+                        return  # Too soon, skip
+                    
+                    pos.last_recovery_check = now
+                    
+                    # Trigger levels (like circuit breakers)
+                    trigger_ai = False
+                    urgency = "normal"
+                    
+                    if loss_deepened_by >= 0.1 and pnl_pct <= -0.2:
+                        # Loss deepening fast + in danger zone
+                        trigger_ai = True
+                        urgency = "high"
+                        logger.warning(f"⚠️ {symbol}: LOSS DEEPENING FAST (-{loss_deepened_by:.2f}% drop)")
+                    elif pnl_pct <= -0.5:
+                        # Deep loss - URGENT
+                        trigger_ai = True
+                        urgency = "urgent"
+                        logger.error(f"🚨 {symbol}: DEEP LOSS {pnl_pct:.2f}% - URGENT AI CHECK")
+                    elif pnl_pct <= -0.3 and not pos.in_recovery_mode:
+                        # Entering recovery zone
+                        trigger_ai = True
+                        urgency = "normal"
+                        logger.info(f"🔄 {symbol}: Entering recovery zone ({pnl_pct:.2f}%)")
+                    
+                    # === EXECUTE FAST AI CHECK ===
+                    if trigger_ai and self.ai_mode == 'autonomous':
+                        pos.recovery_attempts += 1
+                        logger.info(f"🤖 {symbol}: FAST AI RECOVERY CHECK #{pos.recovery_attempts} | Urgency: {urgency.upper()}")
+                        
+                        # Get fresh market data
+                        try:
+                            symbol_ccxt = to_futures_symbol(symbol)
+                            df = await self._fetch_data_with_retry(symbol_ccxt)
+                            if df is None or len(df) < 50:
+                                logger.warning(f"⚠️ {symbol}: Cannot fetch data for recovery check")
+                                return
+                            
+                            # Calculate ATR for context
+                            high_low = df['high'] - df['low']
+                            atr = high_low.rolling(14).mean().iloc[-1]
+                            
+                            # Call unified exit logic with recovery focus
+                            unified_decision = self.ai_filter.unified_exit_logic(
+                                symbol=symbol,
+                                position={
+                                    'side': side,
+                                    'entry_price': entry_price,
+                                    'current_price': current_price,
+                                    'size': pos.remaining_size,
+                                    'unrealized_pnl_pct': pnl_pct,
+                                    'unrealized_pnl_usd': pnl_usd,
+                                    'stop_loss': getattr(pos, 'stop_loss', 0),
+                                    'peak_profit_pct': pos.peak_profit_pct,
+                                    'peak_profit_usd': pos.peak_profit_usd,
+                                    'deepest_loss_pct': pos.deepest_loss_pct,  # NEW
+                                    'deepest_loss_usd': pos.deepest_loss_usd,  # NEW
+                                    'recovery_attempts': pos.recovery_attempts,  # NEW
+                                    'in_recovery_mode': pos.in_recovery_mode,  # NEW
+                                    'urgency': urgency  # NEW: Tell AI how urgent this is
+                                },
+                                df=df,
+                                current_price=current_price,
+                                atr=atr
+                            )
+                            
+                            action = unified_decision.get('action', 'hold')
+                            reasoning = unified_decision.get('reasoning', '')
+                            confidence = unified_decision.get('confidence', 0.5)
+                            
+                            logger.info(f"🤖 {symbol}: FAST AI DECISION: {action.upper()} ({confidence:.0%})")
+                            logger.info(f"   Reasoning: {reasoning[:120]}")
+                            
+                            # Handle decision
+                            if action == 'hold_recovery':
+                                pos.in_recovery_mode = True
+                                recovery_score = unified_decision.get('recovery_score', 0)
+                                logger.info(f"🔄 {symbol}: HOLDING FOR RECOVERY | Score: {recovery_score}/100")
+                            elif action == 'close':
+                                # AI says exit NOW
+                                logger.error(f"🚨 {symbol}: AI FAST EXIT | {reasoning}")
+                                if self.position and symbol == self.position.symbol.replace('/', ''):
+                                    await self._close_position(f"Fast AI Exit: {reasoning}", current_price)
+                                else:
+                                    await self._close_position_by_symbol(symbol, f"Fast AI Exit: {reasoning}", current_price)
+                        
+                        except Exception as ai_err:
+                            logger.error(f"❌ {symbol}: Fast AI check failed: {ai_err}")
+            
+            else:
+                # Position is profitable - check if recovering from loss
+                if pos.in_recovery_mode and pos.deepest_loss_pct < 0:
+                    # RECOVERY SUCCESS!
+                    recovery_gain = pnl_pct - pos.deepest_loss_pct
+                    logger.info(f"✅ {symbol}: RECOVERY SUCCESS! | From {pos.deepest_loss_pct:.2f}% → {pnl_pct:.2f}% (+{recovery_gain:.2f}%)")
+                    pos.in_recovery_mode = False
+                    # Reset loss tracking
+                    pos.deepest_loss_pct = 0.0
+                    pos.deepest_loss_usd = 0.0
+        
+        except Exception as e:
+            logger.error(f"❌ Recovery monitoring error for {symbol}: {e}")
+    
     async def _close_position_by_symbol(self, symbol: str, reason: str, price: float):
         """Close a specific position from the multi-position dict by symbol.
         
@@ -13412,6 +14166,7 @@ Reply in JSON:
             self.stats.total_trades += 1
             self.stats.total_pnl += pnl
             self.stats.today_pnl += pnl
+            self.weekly_pnl += pnl  # Track weekly P&L for circuit breaker
             if is_win:
                 self.stats.winning_trades += 1
                 self.consecutive_wins += 1

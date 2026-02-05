@@ -173,9 +173,9 @@ class AISignalFilter:
         # Per-symbol loss tracking for cooldown periods
         # Dict of {symbol: {"last_loss_time": datetime, "consecutive_losses": int}}
         self.symbol_loss_tracker = {}
-        self.SYMBOL_COOLDOWN_MINUTES = 60  # Minutes to wait after loss on a symbol
+        self.SYMBOL_COOLDOWN_MINUTES = 120  # 2 hours after loss on a symbol (was 60)
         self.MAX_SYMBOL_LOSSES = 2  # After N consecutive losses, longer cooldown
-        self.EXTENDED_COOLDOWN_MINUTES = 180  # 3 hours after repeated losses
+        self.EXTENDED_COOLDOWN_MINUTES = 360  # 6 hours after repeated losses (was 180)
         
         # Proactive scan threshold - lower = more aggressive (PhD-calibrated: 55)
         self.proactive_threshold = 55
@@ -646,13 +646,21 @@ class AISignalFilter:
             
             monitor = NewsMonitor()
             
-            # Run async function in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Run async function - handle both sync and async contexts
             try:
-                summary = loop.run_until_complete(monitor.get_market_summary())
-            finally:
-                loop.close()
+                # Check if there's already a running event loop
+                loop = asyncio.get_running_loop()
+                # Already in async context - create a task and use nest_asyncio or return default
+                # For safety, just return cached/default values in async context
+                return self._get_default_news_context()
+            except RuntimeError:
+                # No running loop - safe to create one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    summary = loop.run_until_complete(monitor.get_market_summary())
+                finally:
+                    loop.close()
             
             # Extract key info for AI
             sentiment = summary.get('sentiment', {})
@@ -703,14 +711,18 @@ class AISignalFilter:
             
         except Exception as e:
             logger.debug(f"News context fetch error: {e}")
-            return {
-                'fear_greed_index': 50,
-                'fear_greed_label': 'Unknown',
-                'market_cap_change_24h': 0,
-                'news_sentiment': 0,
-                'critical_headlines': [],
-                'warning': ''
-            }
+            return self._get_default_news_context()
+    
+    def _get_default_news_context(self) -> Dict[str, Any]:
+        """Return default news context when async fetch isn't possible."""
+        return {
+            'fear_greed_index': 50,
+            'fear_greed_label': 'Neutral',
+            'market_cap_change_24h': 0,
+            'news_sentiment': 0,
+            'critical_headlines': [],
+            'warning': ''
+        }
 
     def record_system_message(self, message: str):
         """Record a system-level event to the chat history."""
@@ -1728,14 +1740,16 @@ Respond ONLY with JSON:
                     logger.warning(f"   🚫🚫 {symbol}: SHORT BLOCKED - IN SUPPORT ZONE with {s_touch} bounces [${s_lower:.4f} - ${s_upper:.4f}]")
                     continue
                 
-                # NEW: Block LONG if price is in top 12% of range (near resistance even if not in zone)
-                if best_signal == 1 and pos_range >= 88:
-                    logger.warning(f"   🚫🚫 {symbol}: LONG BLOCKED - TOO CLOSE TO RESISTANCE (Range={pos_range:.0f}% >= 88%)")
+                # NEW: Block LONG if price is in top 30% of range (near resistance even if not in zone)
+                # Changed from 80% to 70% for symmetry with SHORT blocking at 30%
+                if best_signal == 1 and pos_range >= 70:
+                    logger.warning(f"   🚫🚫 {symbol}: LONG BLOCKED - TOO CLOSE TO RESISTANCE (Range={pos_range:.0f}% >= 70%)")
                     continue
                 
-                # NEW: Block SHORT if price is in bottom 12% of range (near support even if not in zone)
-                if best_signal == -1 and pos_range <= 12:
-                    logger.warning(f"   🚫🚫 {symbol}: SHORT BLOCKED - TOO CLOSE TO SUPPORT (Range={pos_range:.0f}% <= 12%)")
+                # NEW: Block SHORT if price is in bottom 30% of range (near support even if not in zone)
+                # Changed from 20% to 30% because ZORA short at 24% bounced and lost money
+                if best_signal == -1 and pos_range <= 30:
+                    logger.warning(f"   🚫🚫 {symbol}: SHORT BLOCKED - TOO CLOSE TO SUPPORT (Range={pos_range:.0f}% <= 30%)")
                     continue
                 
                 # ═══════════════════════════════════════════════════════════════
@@ -1746,6 +1760,25 @@ Respond ONLY with JSON:
                 # REMOVED: Old "at_resistance" / "at_support" blocks - too strict
                 # The new zone + 3 bounces requirement above is the ONLY zone check now
                 
+                # ═══════════════════════════════════════════════════════════════
+                # EXTREME SENTIMENT FILTER: When market is in extreme fear/greed,
+                # require stronger confirmation before entry
+                # ═══════════════════════════════════════════════════════════════
+                news_ctx = self._get_news_context()
+                fear_greed = news_ctx.get('fear_greed_index', 50)
+                
+                # In EXTREME FEAR (<20), be cautious about LONGs - market might keep falling
+                # Require price to be in lower part of range (near support) for better entries
+                if fear_greed < 20 and best_signal == 1 and pos_range >= 50:
+                    logger.warning(f"   🚫 {symbol}: LONG BLOCKED - EXTREME FEAR ({fear_greed}) + Price in upper range ({pos_range:.0f}%). Wait for price near support.")
+                    continue
+                
+                # In EXTREME GREED (>80), be cautious about SHORTs - market might keep rising
+                # Require price to be in upper part of range (near resistance) for better entries  
+                if fear_greed > 80 and best_signal == -1 and pos_range <= 50:
+                    logger.warning(f"   🚫 {symbol}: SHORT BLOCKED - EXTREME GREED ({fear_greed}) + Price in lower range ({pos_range:.0f}%). Wait for price near resistance.")
+                    continue
+                
                 # Add level warning to context for AI to consider (info only, not blocking)
                 level_warning = levels.get('warning')
                 
@@ -1754,28 +1787,39 @@ Respond ONLY with JSON:
                 reasons_against = best_check.get('reasons_against', [])
                 
                 # ═══════════════════════════════════════════════════════════════
-                # MOMENTUM-FIRST APPROACH: When following momentum, we SKIP
-                # the old counter-trend checks. Those were designed for reversal
-                # trading which loses money. Momentum trading is simpler:
-                # - Price going UP + ROC positive → GO LONG
-                # - Price going DOWN + ROC negative → GO SHORT
-                # The AI in Stage 3 will do final validation.
+                # MOMENTUM DIRECTION MUST MATCH TRADE DIRECTION!
+                # This is the MOST IMPORTANT filter - we don't trade against momentum
                 # ═══════════════════════════════════════════════════════════════
                 
                 # Only one remaining filter: Is momentum STRONG enough?
-                MIN_MOMENTUM_STRENGTH = 0.3  # Need at least 0.3% ROC5 to proceed
+                MIN_MOMENTUM_STRENGTH = 0.75  # Need at least 0.75% ROC5 to proceed (increased from 0.3%)
                 momentum_strength = abs(momentum_5)
                 if momentum_strength < MIN_MOMENTUM_STRENGTH:
                     logger.info(f"   ❌ {symbol}: WEAK momentum ({momentum_strength:.2f}% < {MIN_MOMENTUM_STRENGTH}%)")
                     continue
                 
+                # 🚨 CRITICAL: Momentum direction MUST match trade direction!
+                # LONG requires positive momentum (price rising)
+                # SHORT requires negative momentum (price falling)
+                if best_signal == 1 and momentum_5 < 0:
+                    logger.warning(f"   🚫 {symbol}: LONG BLOCKED - Momentum is NEGATIVE ({momentum_5:+.2f}%). Price is falling, not rising!")
+                    continue
+                    
+                if best_signal == -1 and momentum_5 > 0:
+                    logger.warning(f"   🚫 {symbol}: SHORT BLOCKED - Momentum is POSITIVE ({momentum_5:+.2f}%). Price is rising, not falling!")
+                    continue
+                
                 logger.info(f"📊 STAGE 2 PASS: {symbol} {'LONG' if best_signal == 1 else 'SHORT'} | Score={best_math_score:.0f} | ROC5={momentum_5:+.2f}%")
+                
+                # Get PhD math score from comprehensive check for better sorting
+                phd_math_score = best_check.get('score', best_math_score)
                 
                 math_ranked.append({
                     'symbol': symbol,
                     'signal': best_signal,
                     'direction': 'LONG' if best_signal == 1 else 'SHORT',
-                    'math_score': best_math_score,
+                    'math_score': best_math_score,  # Stage 2 score (momentum weighted)
+                    'phd_score': phd_math_score,    # PhD comprehensive score (for sorting)
                     'math_check': best_check,
                     'price': price,
                     'atr': atr,
@@ -1797,8 +1841,9 @@ Respond ONLY with JSON:
                     'pipeline_stats': pipeline_stats
                 }
             
-            # Sort by math score for Stage 3
-            math_ranked.sort(key=lambda x: x['math_score'], reverse=True)
+            # Sort by PhD math score (comprehensive analysis) for Stage 3
+            # This prioritizes trades with better mathematical backing over pure momentum
+            math_ranked.sort(key=lambda x: x.get('phd_score', x['math_score']), reverse=True)
             pipeline_stats['stage2_passed'] = len(math_ranked)
             
             # ═══════════════════════════════════════════════════════════════
@@ -1834,8 +1879,14 @@ Respond ONLY with JSON:
                         level_info = candidate.get('level_info', {})
                         
                         # Build advanced math section for the winning direction
+                        # IMPORTANT: Use Stage 2 momentum-blended score for consistency
+                        # PhD metrics are shown as details, but the overall score must match
+                        # what was used to rank candidates (prevents AI seeing conflicting scores)
                         winning_check = long_check if math_direction == 'LONG' else short_check
-                        advanced_math_section = self._build_math_analysis_section(winning_check)
+                        winning_check_for_display = winning_check.copy()
+                        winning_check_for_display['score'] = math_score  # Use Stage 2 score, not PhD score
+                        winning_check_for_display['approved'] = math_score >= 45  # Match Stage 2 threshold
+                        advanced_math_section = self._build_math_analysis_section(winning_check_for_display)
                         
                         # Log advanced math integration for Stage 3
                         detailed = winning_check.get('detailed_analysis', {})
@@ -1871,21 +1922,22 @@ Respond ONLY with JSON:
                         
                         if ai_decision == 'REJECT':
                             # AI says NO TRADE
+                            # TESTING OVERRIDE DISABLED - was causing AI flip-flop (approve then immediate exit)
                             candidate['ai_approved'] = False
                             candidate['ai_confidence'] = ai_confidence
                             candidate['ai_score'] = 20 + (1 - ai_confidence) * 30
                             candidate['ai_reasoning'] = ai_reasoning
                             logger.info(f"📊 {candidate['symbol']}: AI ❌ REJECT (conf={ai_confidence:.0%}) - {ai_reasoning[:60]}")
-                        elif ai_confidence < 0.55:
+                        elif ai_confidence < 0.50:
                             # AI says yes but not confident enough - TREAT AS REJECT
-                            # Lowered from 60% to 55% - give AI more autonomy
+                            # Restored from 45% to 50% (normal is 55%)
                             candidate['ai_approved'] = False
                             candidate['ai_confidence'] = ai_confidence
                             candidate['ai_score'] = ai_confidence * 50  # Reduced score for low confidence
-                            candidate['ai_reasoning'] = f"Low confidence ({ai_confidence:.0%}) - need 55%+: {ai_reasoning}"
-                            logger.warning(f"📊 {candidate['symbol']}: AI {ai_decision} but LOW CONF ({ai_confidence:.0%} < 55%) - treating as REJECT")
+                            candidate['ai_reasoning'] = f"Low confidence ({ai_confidence:.0%}) - need 50%+: {ai_reasoning}"
+                            logger.warning(f"📊 {candidate['symbol']}: AI {ai_decision} but LOW CONF ({ai_confidence:.0%} < 50%) - treating as REJECT")
                         else:
-                            # AI approved a direction (55%+ confidence)
+                            # AI approved with 50%+ confidence (normal is 55%)
                             candidate['ai_approved'] = True
                             candidate['ai_confidence'] = ai_confidence
                             candidate['ai_score'] = ai_confidence * 100
@@ -1897,6 +1949,7 @@ Respond ONLY with JSON:
                                 logger.warning(f"🔄 {candidate['symbol']}: AI REVERSED direction! Math said {math_direction}, AI says {ai_decision}")
                                 candidate['direction'] = ai_decision
                                 candidate['signal'] = 1 if ai_decision == 'LONG' else -1
+                                candidate['ai_reversed_direction'] = True  # Flag for penalty
                                 # Update math score for new direction
                                 if ai_decision == 'LONG':
                                     candidate['math_score'] = long_score
@@ -1904,6 +1957,8 @@ Respond ONLY with JSON:
                                 else:
                                     candidate['math_score'] = short_score
                                     candidate['math_check'] = short_check
+                            else:
+                                candidate['ai_reversed_direction'] = False
                             
                             logger.info(f"📊 {candidate['symbol']}: AI ✅ {ai_decision} (conf={ai_confidence:.0%}) - {ai_reasoning[:60]}")
                         
@@ -1957,21 +2012,34 @@ Respond ONLY with JSON:
             best = ai_approved_candidates[0]
             
             # === THRESHOLDS FOR AI-APPROVED TRADES ===
-            MIN_COMBINED_SCORE = 70  # Require strong conviction from both Math AND AI
-            MIN_MATH_SCORE = 55      # Default minimum math score
-            MIN_MATH_SCORE_AI_HIGH_CONF = 50  # For high confidence AI
-            MIN_MATH_SCORE_LONG_PREFERRED = 30  # SPECIAL: For LONG when historical LONG WR > 65%
+            # Balanced mode: Allow good trades while maintaining quality
+            MIN_COMBINED_SCORE = 55  # Reasonable combined score
+            MIN_MATH_SCORE = 45      # Standard math threshold
+            MIN_MATH_SCORE_AI_HIGH_CONF = 38  # Lower for high confidence AI (75%+)
+            MIN_MATH_SCORE_LONG_PREFERRED = 35  # Lower for historically winning LONG
+            MIN_MATH_SCORE_REVERSAL = 50  # Higher when AI reverses math direction
             
             ai_confidence = best.get('ai_confidence', 0.5)
             ai_direction = best.get('direction', '')
+            ai_reversed = best.get('ai_reversed_direction', False)
+            
+            # NOTE: Removed market regime filter (Fear & Greed based blocking)
+            # Reason: API unreliable, data stale (daily), and the math analysis
+            # already accounts for momentum. The real fix is the reversal penalty below.
             
             # Get historical direction performance  
             dir_perf = self._get_direction_performance()
             long_wr = dir_perf.get('long_wr', 50)
             
+            # === DIRECTION REVERSAL PENALTY ===
+            # When AI reverses math's direction, require HIGHER math score
+            # This prevents AI from fighting strong trends
+            if ai_reversed:
+                effective_min_math = MIN_MATH_SCORE_REVERSAL
+                logger.warning(f"   ⚠️ AI REVERSED direction - requiring higher math: {effective_min_math}")
             # SPECIAL RULE: If AI says LONG and our LONG WR is excellent, trust the AI!
             # The math scores low for LONG in bearish momentum, but LONG historically wins
-            if ai_direction == 'LONG' and long_wr >= 65:
+            elif ai_direction == 'LONG' and long_wr >= 65:
                 effective_min_math = MIN_MATH_SCORE_LONG_PREFERRED
                 logger.info(f"   📈 LONG preferred (WR={long_wr:.0f}%) - using lower math threshold: {effective_min_math}")
             elif ai_confidence >= 0.75:
@@ -2070,6 +2138,41 @@ Respond ONLY with JSON:
             tp1_hit = position.get('tp1_hit', False)
             tp2_hit = position.get('tp2_hit', False)
             
+            # Calculate PnL for logging
+            if side == 'LONG':
+                quick_pnl = ((current_price - entry_price) / entry_price) * 100
+            else:
+                quick_pnl = ((entry_price - current_price) / entry_price) * 100
+            
+            logger.info(f"📊 POSITION CHECK: {symbol} {side} | Entry=${entry_price:.4f} | Now=${current_price:.4f} | PnL={quick_pnl:+.2f}%")
+            
+            # === S/R DISTANCE CHECK ===
+            # Show how close we are to support and resistance levels
+            try:
+                sr_levels = self._detect_resistance_support_levels(df, current_price)
+                dist_to_resistance = sr_levels.get('distance_to_resistance_pct', 99)
+                dist_to_support = sr_levels.get('distance_to_support_pct', 99)
+                range_position = sr_levels.get('position_in_range_pct', 50)
+                in_r_zone = sr_levels.get('in_resistance_zone', False)
+                in_s_zone = sr_levels.get('in_support_zone', False)
+                
+                # Build S/R status string
+                sr_status = f"📍 Range: {range_position:.0f}% | "
+                if in_r_zone:
+                    sr_status += "🚫 IN RESISTANCE ZONE"
+                elif in_s_zone:
+                    sr_status += "🚫 IN SUPPORT ZONE"
+                elif dist_to_resistance < 1.0:
+                    sr_status += f"⚠️ Near R ({dist_to_resistance:.1f}% away)"
+                elif dist_to_support < 1.0:
+                    sr_status += f"⚠️ Near S ({dist_to_support:.1f}% away)"
+                else:
+                    sr_status += f"R: {dist_to_resistance:.1f}% | S: {dist_to_support:.1f}%"
+                
+                logger.info(f"📊 {symbol}: {sr_status}")
+            except Exception as sr_err:
+                logger.debug(f"S/R check error: {sr_err}")
+            
             # Calculate PnL
             if side == 'LONG':
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -2084,23 +2187,98 @@ Respond ONLY with JSON:
             # Don't run reversal detection on freshly opened positions
             # Give trades at least 2 minutes to develop before considering exit
             import time
-            entry_time = position.get('entry_time', 0)
+            entry_time = position.get('entry_time', 0) or position.get('open_time', 0)
             if entry_time:
                 try:
                     if isinstance(entry_time, str):
-                        from datetime import datetime
+                        # String datetime - parse with fromisoformat
                         entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
                         entry_timestamp = entry_dt.timestamp()
+                    elif isinstance(entry_time, datetime):
+                        # Datetime object - get timestamp directly
+                        entry_timestamp = entry_time.timestamp()
                     else:
+                        # Assume it's a numeric timestamp
                         entry_timestamp = float(entry_time)
                     hold_seconds = time.time() - entry_timestamp
-                except:
+                    logger.debug(f"📊 Hold time calculated: {hold_seconds:.0f}s (entry_type={type(entry_time).__name__})")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not calculate hold time: {e} (entry_time={entry_time}, type={type(entry_time)})")
                     hold_seconds = 999  # Assume old position
             else:
                 hold_seconds = 999  # Assume old position
             
             MIN_HOLD_SECONDS = 120  # 2 minutes minimum before reversal detection
             is_new_position = hold_seconds < MIN_HOLD_SECONDS
+            
+            # === PHASE 0: SMART TINY WIN MANAGEMENT ===
+            # Problem: AI was closing positions with +$0.09 profit on weak signals
+            # Solution: Check if momentum STILL FAVORS us - if yes, HOLD. If reversing, exit.
+            if 0 < pnl_pct < 0.6:  # Small win (0% to 0.6%)
+                logger.info(f"💰 {symbol}: SMALL WIN zone ({pnl_pct:.2f}%) - checking if momentum still favors us")
+                try:
+                    context = self._build_market_context(df, current_price, atr)
+                    roc_5 = context.get('roc_5', 0)
+                    roc_10 = context.get('roc_10', 0)
+                    rsi = context.get('rsi', 50)
+                    
+                    sr_levels = self._detect_resistance_support_levels(df, current_price)
+                    in_r_zone = sr_levels.get('in_resistance_zone', False)
+                    in_s_zone = sr_levels.get('in_support_zone', False)
+                    dist_to_resistance = sr_levels.get('distance_to_resistance_pct', 99)
+                    dist_to_support = sr_levels.get('distance_to_support_pct', 99)
+                    
+                    # Check if momentum STILL FAVORS our direction
+                    momentum_still_good = False
+                    reversal_confirmed = False
+                    
+                    if side == 'LONG':
+                        # LONG: Good if momentum still up, bad if turning down
+                        if roc_5 > 0.1 and roc_10 > 0:
+                            momentum_still_good = True
+                            logger.info(f"   ✅ Momentum still UP (roc_5={roc_5:+.2f}%, roc_10={roc_10:+.2f}%) - HOLD")
+                        elif roc_5 < -0.2 and (in_r_zone or dist_to_resistance < 0.5):
+                            reversal_confirmed = True
+                            logger.info(f"   🔴 REVERSAL: Momentum turning DOWN at resistance (roc_5={roc_5:+.2f}%) - EXIT")
+                        elif roc_5 < -0.3:
+                            reversal_confirmed = True
+                            logger.info(f"   🔴 REVERSAL: Strong downward momentum (roc_5={roc_5:+.2f}%) - EXIT")
+                    else:
+                        # SHORT: Good if momentum still down, bad if turning up
+                        if roc_5 < -0.1 and roc_10 < 0:
+                            momentum_still_good = True
+                            logger.info(f"   ✅ Momentum still DOWN (roc_5={roc_5:+.2f}%, roc_10={roc_10:+.2f}%) - HOLD")
+                        elif roc_5 > 0.2 and (in_s_zone or dist_to_support < 0.5):
+                            reversal_confirmed = True
+                            logger.info(f"   🔴 REVERSAL: Momentum turning UP at support (roc_5={roc_5:+.2f}%) - EXIT")
+                        elif roc_5 > 0.3:
+                            reversal_confirmed = True
+                            logger.info(f"   🔴 REVERSAL: Strong upward momentum (roc_5={roc_5:+.2f}%) - EXIT")
+                    
+                    # DECISION LOGIC
+                    if reversal_confirmed:
+                        # Clear reversal happening - OK to exit even with small profit
+                        logger.info(f"✅ {symbol}: REVERSAL CONFIRMED - Exit small win before it turns to loss")
+                        # Continue to normal exit logic (don't block)
+                    elif momentum_still_good:
+                        # Momentum still in our favor - HOLD for bigger profit
+                        logger.info(f"🔒 {symbol}: MOMENTUM STILL GOOD - Hold for bigger profit (no reversal yet)")
+                        return {
+                            'action': 'hold',
+                            'confidence': 0.75,
+                            'math_score': 0,
+                            'exit_score': 0,
+                            'ai_validated': False,
+                            'reasoning': f"💰 SMALL WIN ({pnl_pct:.2f}%) but momentum still favors us - holding for bigger profit. No reversal detected yet.",
+                            'sl_adjustment': None
+                        }
+                    else:
+                        # Neutral momentum - let AI decide
+                        logger.info(f"⚖️ {symbol}: NEUTRAL momentum - let AI decide on exit")
+                        # Continue to normal exit logic
+                
+                except Exception as tiny_err:
+                    logger.warning(f"Small win check failed: {tiny_err}")
             
             if is_new_position and pnl_pct > -0.5:  # Only skip if not in loss
                 logger.info(f"📊 {symbol}: New position ({hold_seconds:.0f}s old) - skipping reversal check, letting it develop")
@@ -2116,30 +2294,295 @@ Respond ONLY with JSON:
                     'pnl_usd': pnl_usd
                 }
             
-            # === PHASE 1: LOSS MANAGEMENT - CUT LOSSES, DON'T HOLD ===
-            # CRITICAL: We have server-side SL for protection. If we're beyond -1.0%,
-            # something is wrong (SL missed or price gapped). EXIT to prevent bigger loss!
+            # === PHASE 1: LOSS MANAGEMENT - WITH GRACE PERIOD ===
+            # Only cut losses aggressively AFTER the grace period has elapsed
+            # During grace period, allow normal volatility swings
             
-            max_loss_threshold_pct = -1.0   # Exit if loss exceeds -1.0% (tightened from -1.5%)
-            max_loss_threshold_usd = -10    # Exit if loss exceeds -$10 (tightened from -$15)
+            # INCREASED THRESHOLDS - give trades room to breathe!
+            # For a $76 balance, these are reasonable risk levels
+            if is_new_position:
+                # GRACE PERIOD: Use much wider thresholds for new positions
+                max_loss_threshold_pct = -2.5   # Only exit on major moves during grace period
+                max_loss_threshold_usd = -15    # ~20% of balance max during grace
+                logger.debug(f"⏳ {symbol}: Grace period - wider loss thresholds: {max_loss_threshold_pct}% / ${max_loss_threshold_usd}")
+            else:
+                # AFTER GRACE PERIOD: Use tighter but still reasonable thresholds
+                max_loss_threshold_pct = -1.5   # 1.5% loss after grace period (was -0.6%!)
+                max_loss_threshold_usd = -10    # $10 max loss after grace
             
             in_deep_loss = (pnl_pct < max_loss_threshold_pct) or (pnl_usd < max_loss_threshold_usd)
             
             if in_deep_loss:
                 # BEYOND ACCEPTABLE LOSS - EXIT NOW to prevent deeper loss
                 # The server-side SL should have triggered - if we're here, exit manually
-                logger.warning(f"🚨 {symbol}: LOSS EXCEEDED THRESHOLD (PnL: {pnl_pct:.2f}% / ${pnl_usd:.2f}) - EXITING to prevent deeper loss!")
+                grace_status = "DURING GRACE" if is_new_position else "AFTER GRACE"
+                logger.warning(f"🚨 {symbol}: LOSS EXCEEDED THRESHOLD {grace_status} (PnL: {pnl_pct:.2f}% / ${pnl_usd:.2f}) - EXITING!")
                 return {
                     'action': 'close',
                     'confidence': 0.95,
                     'math_score': 0,
                     'exit_score': 100,
                     'ai_validated': True,
-                    'reasoning': f"🚨 LOSS PROTECTION: {pnl_pct:.2f}% loss exceeds -1.5% threshold - closing to prevent deeper loss",
+                    'reasoning': f"🚨 LOSS PROTECTION: {pnl_pct:.2f}% loss exceeds {max_loss_threshold_pct}% threshold ({grace_status})",
                     'sl_adjustment': None,
                     'pnl_pct': pnl_pct,
                     'pnl_usd': pnl_usd
                 }
+            
+            # === PHASE 0.5: ADVANCED POSITION RECOVERY CHECK ===
+            # For small/moderate losses (-0.15% to -0.5%), check if we should hold for recovery
+            # Uses MATH (momentum + S/R) + AI validation for smart recovery decisions
+            in_recovery_zone = -0.5 < pnl_pct < -0.15 and pnl_usd > -5
+            
+            if in_recovery_zone:
+                # Build context for recovery decision
+                context = self._build_market_context(df, current_price, atr)
+                roc_5 = context.get('roc_5', 0)
+                roc_10 = context.get('roc_10', 0)
+                roc_20 = context.get('roc_20', 0)  # Longer-term momentum
+                rsi = context.get('rsi', 50)
+                volume_ratio = context.get('volume_ratio', 1.0)
+                
+                # Get S/R info
+                try:
+                    sr_levels = self._detect_resistance_support_levels(df, current_price)
+                    dist_to_support = sr_levels.get('distance_to_support_pct', 99)
+                    dist_to_resistance = sr_levels.get('distance_to_resistance_pct', 99)
+                    in_support_zone = sr_levels.get('in_support_zone', False)
+                    in_resistance_zone = sr_levels.get('in_resistance_zone', False)
+                except:
+                    dist_to_support = 99
+                    dist_to_resistance = 99
+                    in_support_zone = False
+                    in_resistance_zone = False
+                
+                # === ADVANCED MOMENTUM ANALYSIS ===
+                # Check if momentum is REVERSING (turning in our favor)
+                momentum_reversing = False
+                momentum_strength = 0
+                
+                if side == 'LONG':
+                    # For LONG: Need momentum turning UP (positive acceleration)
+                    if roc_5 > 0 and roc_5 > roc_10:
+                        momentum_reversing = True
+                        momentum_strength = min(abs(roc_5), 30)  # Cap at 30 points
+                    elif roc_10 > 0 and roc_10 > roc_20:
+                        momentum_reversing = True
+                        momentum_strength = min(abs(roc_10) * 0.5, 15)  # Less weight for slower momentum
+                else:
+                    # For SHORT: Need momentum turning DOWN (negative acceleration)
+                    if roc_5 < 0 and roc_5 < roc_10:
+                        momentum_reversing = True
+                        momentum_strength = min(abs(roc_5), 30)
+                    elif roc_10 < 0 and roc_10 < roc_20:
+                        momentum_reversing = True
+                        momentum_strength = min(abs(roc_10) * 0.5, 15)
+                
+                # Calculate recovery score (0-100)
+                recovery_score = 0
+                recovery_reasons = []
+                
+                # === MOMENTUM FACTORS (0-45 points) ===
+                if momentum_reversing:
+                    recovery_score += momentum_strength
+                    recovery_reasons.append(f"🔄 Momentum REVERSING in our favor (strength: {momentum_strength:.0f})")
+                elif side == 'LONG' and roc_5 > 0:
+                    recovery_score += 15
+                    recovery_reasons.append("📈 Short-term momentum turning up")
+                elif side == 'SHORT' and roc_5 < 0:
+                    recovery_score += 15
+                    recovery_reasons.append("📉 Short-term momentum turning down")
+                
+                # === RSI FACTORS (0-20 points) ===
+                if side == 'LONG':
+                    if rsi < 30:
+                        recovery_score += 20
+                        recovery_reasons.append(f"✅ RSI EXTREME oversold ({rsi:.0f}) - strong bounce expected")
+                    elif rsi < 40:
+                        recovery_score += 12
+                        recovery_reasons.append(f"✅ RSI oversold ({rsi:.0f}) - bounce likely")
+                else:
+                    if rsi > 70:
+                        recovery_score += 20
+                        recovery_reasons.append(f"✅ RSI EXTREME overbought ({rsi:.0f}) - strong pullback expected")
+                    elif rsi > 60:
+                        recovery_score += 12
+                        recovery_reasons.append(f"✅ RSI overbought ({rsi:.0f}) - pullback likely")
+                
+                # === S/R FACTORS (0-30 points) ===
+                if side == 'LONG':
+                    if in_support_zone:
+                        recovery_score += 30
+                        recovery_reasons.append(f"💪 IN SUPPORT ZONE - very strong bounce zone")
+                    elif dist_to_support < 0.5:
+                        recovery_score += 25
+                        recovery_reasons.append(f"💪 Near support ({dist_to_support:.1f}% away) - strong bounce zone")
+                    elif dist_to_support < 1.5:
+                        recovery_score += 15
+                        recovery_reasons.append(f"📍 Approaching support ({dist_to_support:.1f}% away)")
+                    # Penalty
+                    if in_resistance_zone:
+                        recovery_score -= 25
+                        recovery_reasons.append("⚠️ At resistance - recovery very difficult")
+                    elif dist_to_resistance < 1.0:
+                        recovery_score -= 15
+                        recovery_reasons.append("⚠️ Near resistance - limited upside")
+                else:
+                    if in_resistance_zone:
+                        recovery_score += 30
+                        recovery_reasons.append(f"💪 IN RESISTANCE ZONE - very strong rejection zone")
+                    elif dist_to_resistance < 0.5:
+                        recovery_score += 25
+                        recovery_reasons.append(f"💪 Near resistance ({dist_to_resistance:.1f}% away) - strong rejection zone")
+                    elif dist_to_resistance < 1.5:
+                        recovery_score += 15
+                        recovery_reasons.append(f"📍 Approaching resistance ({dist_to_resistance:.1f}% away)")
+                    # Penalty
+                    if in_support_zone:
+                        recovery_score -= 25
+                        recovery_reasons.append("⚠️ At support - recovery very difficult")
+                    elif dist_to_support < 1.0:
+                        recovery_score -= 15
+                        recovery_reasons.append("⚠️ Near support - limited downside")
+                
+                # === VOLUME CONFIRMATION (0-10 points) ===
+                if volume_ratio > 1.5:
+                    recovery_score += 10
+                    recovery_reasons.append(f"📊 High volume ({volume_ratio:.1f}x) - strong conviction")
+                elif volume_ratio < 0.7:
+                    recovery_score -= 5
+                    recovery_reasons.append(f"⚠️ Low volume ({volume_ratio:.1f}x) - weak move")
+                
+                # === DECISION LOGIC ===
+                # Math score >= 50: Strong recovery signals, ask AI for validation
+                # Math score 40-49: Borderline, ask AI to decide
+                # Math score < 40: Too weak, exit normally
+                
+                logger.info(f"🔄 {symbol}: RECOVERY CHECK (PnL: {pnl_pct:.2f}%) | Math Score: {recovery_score}/100")
+                for reason in recovery_reasons[:4]:  # Show top 4 reasons
+                    logger.info(f"   {reason}")
+                
+                if recovery_score >= 40:
+                    # === AI VALIDATION FOR RECOVERY ===
+                    # Ask AI to validate the recovery decision
+                    ai_recovery_decision = None
+                    
+                    if self.use_ai and recovery_score >= 40:
+                        logger.info(f"🤖 {symbol}: Consulting AI for recovery validation (math score: {recovery_score})")
+                        
+                        # Extract real-time tracking data from position
+                        deepest_loss_pct = position.get('deepest_loss_pct', pnl_pct)
+                        deepest_loss_usd = position.get('deepest_loss_usd', pnl_usd)
+                        recovery_attempts = position.get('recovery_attempts', 0)
+                        in_recovery_mode = position.get('in_recovery_mode', False)
+                        urgency = position.get('urgency', 'normal')
+                        
+                        # Calculate if recovering
+                        is_recovering = deepest_loss_pct < pnl_pct < 0  # Loss getting smaller
+                        recovery_progress = abs(pnl_pct - deepest_loss_pct) if is_recovering else 0
+                        
+                        # Build recovery-specific AI prompt with real-time context
+                        recovery_context = f"""You are analyzing a position that's in a SMALL LOSS and deciding if it should be HELD for RECOVERY.
+
+Position: {side} {symbol}
+Entry: ${entry_price:.4f} → Current: ${current_price:.4f}
+Loss: {pnl_pct:.2f}% (${pnl_usd:.2f})
+
+REAL-TIME TRACKING:
+• Deepest Loss: {deepest_loss_pct:.2f}% (worst point)
+• Recovery Status: {'✅ RECOVERING (+' + f'{recovery_progress:.2f}%)' if is_recovering else '❌ STILL DEEPENING'}
+• Recovery Attempts: #{recovery_attempts} (times AI has evaluated this)
+• Already in Recovery Mode: {'YES' if in_recovery_mode else 'NO'}
+• Urgency Level: {urgency.upper()} {'🚨' if urgency == 'urgent' else '⚠️' if urgency == 'high' else ''}
+
+MATH RECOVERY SCORE: {recovery_score}/100 (40+ = consider recovery)
+
+Recovery Factors Detected:
+{chr(10).join(recovery_reasons[:5])}
+
+Market Context:
+• Momentum: roc_5={roc_5:+.2f}%, roc_10={roc_10:+.2f}%, roc_20={roc_20:+.2f}%
+• RSI: {rsi:.0f} ({('OVERSOLD' if rsi < 40 else 'OVERBOUGHT' if rsi > 60 else 'NEUTRAL')})
+• S/R: {dist_to_resistance:.1f}% to R | {dist_to_support:.1f}% to S
+• Volume: {volume_ratio:.1f}x average
+
+QUESTION: Should we HOLD this position for recovery, or EXIT to prevent further loss?
+
+Consider:
+1. Is momentum TRULY reversing in our favor?
+2. Are we at a KEY support/resistance level likely to bounce/reject?
+3. Is the loss small enough that a reversal could quickly turn profitable?
+4. Are there any hidden risks (trend, volume, market conditions)?
+
+Your decision (respond EXACTLY in this format):
+<DECISION>
+Action: HOLD_RECOVERY or EXIT
+Confidence: [0-100]
+Reasoning: [Your 1-sentence analysis]
+</DECISION>"""
+                        
+                        try:
+                            ai_response = self._call_ai_api(recovery_context)
+                            
+                            if ai_response and '<DECISION>' in ai_response:
+                                decision_text = ai_response.split('<DECISION>')[1].split('</DECISION>')[0].strip()
+                                
+                                # Parse AI decision
+                                ai_action = None
+                                ai_confidence = 0
+                                ai_reasoning = ""
+                                
+                                for line in decision_text.split('\n'):
+                                    if 'Action:' in line:
+                                        ai_action = 'hold_recovery' if 'HOLD' in line.upper() else 'close'
+                                    elif 'Confidence:' in line:
+                                        try:
+                                            ai_confidence = int(''.join(filter(str.isdigit, line)))
+                                        except:
+                                            ai_confidence = 50
+                                    elif 'Reasoning:' in line:
+                                        ai_reasoning = line.split('Reasoning:')[1].strip()
+                                
+                                logger.info(f"🤖 AI Recovery Decision: {ai_action.upper()} ({ai_confidence}%) - {ai_reasoning[:80]}")
+                                
+                                # AI validates recovery
+                                if ai_action == 'hold_recovery' and ai_confidence >= 55:
+                                    return {
+                                        'action': 'hold_recovery',
+                                        'confidence': min(0.85, ai_confidence / 100),
+                                        'math_score': recovery_score,
+                                        'exit_score': 0,
+                                        'ai_validated': True,
+                                        'reasoning': f"🔄 AI+MATH RECOVERY: {ai_reasoning[:100]}. Math: {recovery_score}/100, AI: {ai_confidence}%",
+                                        'sl_adjustment': None,
+                                        'pnl_pct': pnl_pct,
+                                        'pnl_usd': pnl_usd,
+                                        'recovery_score': recovery_score,
+                                        'ai_confidence': ai_confidence
+                                    }
+                                else:
+                                    logger.info(f"❌ AI rejected recovery: {ai_reasoning}")
+                        
+                        except Exception as ai_err:
+                            logger.warning(f"⚠️ AI recovery validation failed: {ai_err}")
+                    
+                    # Fallback: If AI unavailable or didn't validate, use math score
+                    if recovery_score >= 60:
+                        # Very high math score - hold even without AI
+                        return {
+                            'action': 'hold_recovery',
+                            'confidence': 0.70,
+                            'math_score': recovery_score,
+                            'exit_score': 0,
+                            'ai_validated': False,
+                            'reasoning': f"🔄 MATH RECOVERY: Strong signals (score: {recovery_score}/100). " + "; ".join(recovery_reasons[:2]),
+                            'sl_adjustment': None,
+                            'pnl_pct': pnl_pct,
+                            'pnl_usd': pnl_usd,
+                            'recovery_score': recovery_score
+                        }
+                else:
+                    logger.info(f"❌ {symbol}: NO RECOVERY - Math score {recovery_score}/100 too low (need 40+)")
             
             # === PHASE 1B: SMART PROFIT PROTECTION ===
             # CRITICAL: This is NOT about hitting a profit number!
@@ -2157,31 +2600,43 @@ Respond ONLY with JSON:
             
             # === PHASE 1C: INTELLIGENT PROFIT REVERSAL DETECTION ===
             # DYNAMIC SYSTEM: Track peak profit and detect drawdown from peak
-            # No hardcoded thresholds - system learns and adapts based on:
-            # 1. Peak profit reached (X) vs current profit (B, C, or A)
-            # 2. Drawdown percentage from peak
-            # 3. Momentum analysis (ROC, acceleration)
-            # 4. Math+AI combined decision
+            # Using PERCENTAGE as primary metric (like Bybit display: $0.05 (+0.72%))
+            # This is better because:
+            # 1. Independent of position size
+            # 2. Matches exchange display
+            # 3. 0.72% peak → 0.10% current = 86% of gain lost (clear signal!)
             
             # Use existing momentum indicators (roc_5, roc_10) for faster reaction
             context = self._build_market_context(df, current_price, atr)
             roc_5 = context.get('roc_5', 0)   # Rate of change over 5 bars
             roc_10 = context.get('roc_10', 0)  # Rate of change over 10 bars
             
-            # === TRACK PEAK PROFIT (from position object or calculate) ===
-            peak_profit_usd = position.get('peak_profit_usd', pnl_usd)
-            peak_profit_pct = position.get('peak_profit_pct', pnl_pct)
+            # === TRACK PEAK PROFIT using PERCENTAGE (primary metric) ===
+            # Initialize from position or use current PnL
+            peak_profit_pct = position.get('peak_profit_pct', 0)
+            peak_profit_usd = position.get('peak_profit_usd', 0)
             
-            # Update peak if current profit is higher
-            if pnl_usd > peak_profit_usd:
-                peak_profit_usd = pnl_usd
-            if pnl_pct > peak_profit_pct:
+            # Update peak if current profit is higher (use PCT as primary)
+            if pnl_pct > peak_profit_pct and pnl_pct > 0:  # Only track positive peaks
                 peak_profit_pct = pnl_pct
+                peak_profit_usd = pnl_usd  # Update USD too for logging
+                logger.info(f"📈 {symbol}: NEW PEAK! {pnl_pct:.2f}% (${pnl_usd:.2f})")
             
-            # Calculate DRAWDOWN from peak (this is the key metric!)
-            # Example: Peak was $8, now $5 → drawdown = $3 (37.5% of peak lost)
-            drawdown_usd = peak_profit_usd - pnl_usd
-            drawdown_pct_of_peak = (drawdown_usd / peak_profit_usd * 100) if peak_profit_usd > 0 else 0
+            # Calculate DRAWDOWN from peak using PERCENTAGE
+            # Example: Peak was 0.72%, now 0.10% → lost 86% of the gain!
+            if peak_profit_pct > 0.05:  # Only track if we had meaningful profit (>0.05%)
+                drawdown_pct_of_peak = ((peak_profit_pct - pnl_pct) / peak_profit_pct * 100) if peak_profit_pct > 0 else 0
+                drawdown_usd = peak_profit_usd - pnl_usd  # For logging
+                # Log peak tracking status if we have a meaningful peak
+                if peak_profit_pct > 0.1:
+                    if pnl_pct < 0:
+                        # Gone from profit to loss - special messaging
+                        logger.info(f"📊 {symbol}: Peak: {peak_profit_pct:.2f}% → Now: {pnl_pct:.2f}% | ⚠️ IN LOSS (was profitable!)")
+                    else:
+                        logger.info(f"📊 {symbol}: Peak: {peak_profit_pct:.2f}% → Now: {pnl_pct:.2f}% | Lost {drawdown_pct_of_peak:.0f}% of gain")
+            else:
+                drawdown_pct_of_peak = 0
+                drawdown_usd = 0
             
             # Track reversal signals for AI to consider
             profit_reversal_detected = False
@@ -2214,17 +2669,24 @@ Respond ONLY with JSON:
             
             is_new_position = position_age_seconds < min_hold_seconds
             
-            # === REVERSAL DETECTION - ALWAYS RUN IF IN PROFIT ===
-            # Run reversal detection on ANY profit - small profit is better than loss!
-            # The system should always track peak and calculate reversal
+            # === REVERSAL DETECTION - RUN IF WE HAVE/HAD PROFIT ===
+            # CRITICAL FIX: Also run if we HAD meaningful profit (peak_profit_pct > 0.1)
+            # This catches the case where we go from profit into loss!
+            # Example: Peak was +0.26%, now -0.68% - we MUST detect this reversal!
             has_any_profit = pnl_usd > 0 or pnl_pct > 0
+            had_meaningful_profit = peak_profit_pct > 0.1  # We were profitable before
             
             # For NEW positions (< 30 sec), just skip - let them settle
             if is_new_position:
                 logger.debug(f"⏳ {symbol}: New position ({position_age_seconds:.0f}s < 30s) - letting it settle")
                 has_any_profit = False  # Skip reversal detection for brand new positions
+                had_meaningful_profit = False  # Also skip if new
             
-            if len(df) >= 5 and has_any_profit:
+            # Initialize reversal_score here so it's always defined
+            reversal_score = 0
+            
+            # CRITICAL: Run reversal detection if currently in profit OR if we HAD profit before
+            if len(df) >= 5 and (has_any_profit or had_meaningful_profit):
                 # Check recent price action
                 recent_closes = df['close'].tail(10).values if len(df) >= 10 else df['close'].tail(5).values
                 recent_high = max(recent_closes)
@@ -2331,19 +2793,19 @@ Respond ONLY with JSON:
                     fast_reversal_score = 0
                     fast_reversal_signals = []
                 
-                # === MOMENTUM ANALYSIS (slower, 5-10 bars) ===
+                # === MOMENTUM ANALYSIS (slower, 5-10 bars) - MORE SENSITIVE ===
                 if is_long:
-                    momentum_against = roc_5 < 0
-                    strong_momentum_against = roc_5 < -0.5 or roc_10 < -0.3
+                    momentum_against = roc_5 < -0.1  # Slightly negative = turning
+                    strong_momentum_against = roc_5 < -0.3 or roc_10 < -0.2  # Was -0.5/-0.3
                     accelerating_against = roc_5 < roc_10
                     price_drop_pct = ((recent_high - current_close) / recent_high) * 100 if recent_high > 0 else 0
-                    very_strong_reversal = roc_5 < -1.0
+                    very_strong_reversal = roc_5 < -0.7  # Was -1.0
                 else:  # SHORT
-                    momentum_against = roc_5 > 0
-                    strong_momentum_against = roc_5 > 0.5 or roc_10 > 0.3
+                    momentum_against = roc_5 > 0.1  # Slightly positive = turning
+                    strong_momentum_against = roc_5 > 0.3 or roc_10 > 0.2  # Was 0.5/0.3
                     accelerating_against = roc_5 > roc_10
                     price_drop_pct = ((current_close - recent_low) / recent_low) * 100 if recent_low > 0 else 0
-                    very_strong_reversal = roc_5 > 1.0
+                    very_strong_reversal = roc_5 > 0.7  # Was 1.0
                 
                 # === INTELLIGENT REVERSAL DETECTION ===
                 # Combines FAST signals + DRAWDOWN + MOMENTUM
@@ -2360,19 +2822,37 @@ Respond ONLY with JSON:
                     reversal_score += min(25, fast_reversal_score * 0.7)
                     reversal_factors.extend(fast_reversal_signals[:1])
                 
-                # Factor 1: Drawdown from peak (0-60 points) - MOST IMPORTANT!
-                # Lost 25% of peak = 15 pts, 50% = 30 pts, 75% = 45 pts, 90%+ = 60 pts
-                if peak_profit_usd > 0.5 and drawdown_usd > 0:  # Only if we had meaningful profit
-                    # More aggressive scaling - losing profit is SERIOUS
-                    drawdown_score = min(60, drawdown_pct_of_peak * 0.67)  # 90% loss = 60 points
-                    reversal_score += drawdown_score
-                    
-                    # CRITICAL: If we lost 50%+ of peak profit, this is VERY serious
-                    if drawdown_pct_of_peak >= 50 and peak_profit_usd >= 1.0:
-                        reversal_score += 20  # Bonus penalty for major profit loss
-                        reversal_factors.append(f"🚨 MAJOR LOSS: Lost {drawdown_pct_of_peak:.0f}% of ${peak_profit_usd:.2f} peak!")
+                # Factor 1: Drawdown from peak (0-70 points) - MOST IMPORTANT!
+                # Using PERCENTAGE-based thresholds (like Bybit display)
+                # Lost 20% = 15pts, 30% = 25pts, 40% = 35pts, 50%+ = 50pts
+                if peak_profit_pct > 0.1 and drawdown_pct_of_peak > 0:  # Any meaningful profit (>0.1%)
+                    # Aggressive scaling - protect profits early!
+                    if drawdown_pct_of_peak >= 50:
+                        drawdown_score = 50  # Lost half = BIG penalty
+                    elif drawdown_pct_of_peak >= 40:
+                        drawdown_score = 35
                     elif drawdown_pct_of_peak >= 30:
-                        reversal_factors.append(f"📉 Lost {drawdown_pct_of_peak:.0f}% of peak (${drawdown_usd:.2f})")
+                        drawdown_score = 25
+                    elif drawdown_pct_of_peak >= 20:
+                        drawdown_score = 15
+                    else:
+                        drawdown_score = drawdown_pct_of_peak * 0.5
+                    
+                    reversal_score += drawdown_score
+                    logger.debug(f"📊 REVERSAL: drawdown_score={drawdown_score:.1f}, total reversal_score={reversal_score:.1f}")
+                    
+                    # CRITICAL: If we went from PROFIT into LOSS, this is a MAJOR reversal!
+                    # Peak was positive, now we're negative = 100%+ of peak lost
+                    if pnl_pct < 0 and peak_profit_pct > 0.1:
+                        reversal_score += 35  # SEVERE penalty - we lost ALL profit and went negative
+                        reversal_factors.append(f"🚨🚨 PROFIT→LOSS: Was +{peak_profit_pct:.2f}% now {pnl_pct:.2f}%!")
+                        logger.warning(f"🚨 {symbol}: PROFIT→LOSS REVERSAL! Peak +{peak_profit_pct:.2f}% → Now {pnl_pct:.2f}%")
+                    # ALERT: If we lost 30%+ of peak profit, this is concerning
+                    elif drawdown_pct_of_peak >= 30 and peak_profit_pct >= 0.3:
+                        reversal_score += 15  # Bonus penalty for significant profit loss
+                        reversal_factors.append(f"🚨 PROFIT DECAY: Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak!")
+                    elif drawdown_pct_of_peak >= 20:
+                        reversal_factors.append(f"📉 Lost {drawdown_pct_of_peak:.0f}% of peak ({peak_profit_pct:.2f}%→{pnl_pct:.2f}%)")
                 
                 # Factor 2: Momentum against position (0-25 points)
                 if momentum_against:
@@ -2431,36 +2911,135 @@ Respond ONLY with JSON:
                         reversal_score += 12
                         reversal_factors.append(f"⚠️ RSI oversold ({rsi:.0f})")
                 
+                # === MOMENTUM HOPE - CAN REDUCE REVERSAL SCORE ===
+                # If momentum is STILL WITH US despite drawdown, give it a chance
+                # This prevents exiting during temporary dips when trend is intact
+                momentum_hope = 0
+                momentum_hope_factors = []
+                
+                if is_long:
+                    # LONG: Positive momentum = hope
+                    if roc_5 > 0.2:  # Strong positive momentum
+                        momentum_hope += 15
+                        momentum_hope_factors.append(f"📈 ROC5 still positive ({roc_5:+.2f}%)")
+                    elif roc_5 > 0:  # Slight positive
+                        momentum_hope += 8
+                        momentum_hope_factors.append(f"📊 ROC5 flat/positive ({roc_5:+.2f}%)")
+                    
+                    if roc_10 > 0.3:  # Longer term trend intact
+                        momentum_hope += 10
+                        momentum_hope_factors.append(f"📈 10-bar trend up ({roc_10:+.2f}%)")
+                    
+                    # RSI not overbought yet = room to run
+                    if 40 <= rsi <= 65:
+                        momentum_hope += 8
+                        momentum_hope_factors.append(f"✅ RSI healthy ({rsi:.0f})")
+                    
+                    # Price still above key MAs
+                    if current_close > context.get('ema_20', 0) and context.get('ema_20', 0) > 0:
+                        momentum_hope += 10
+                        momentum_hope_factors.append("📊 Above EMA20")
+                        
+                else:  # SHORT
+                    # SHORT: Negative momentum = hope
+                    if roc_5 < -0.2:  # Strong downward momentum
+                        momentum_hope += 15
+                        momentum_hope_factors.append(f"📉 ROC5 still negative ({roc_5:+.2f}%)")
+                    elif roc_5 < 0:  # Slight negative
+                        momentum_hope += 8
+                        momentum_hope_factors.append(f"📊 ROC5 flat/negative ({roc_5:+.2f}%)")
+                    
+                    if roc_10 < -0.3:  # Longer term trend intact
+                        momentum_hope += 10
+                        momentum_hope_factors.append(f"📉 10-bar trend down ({roc_10:+.2f}%)")
+                    
+                    # RSI not oversold yet = room to fall
+                    if 35 <= rsi <= 60:
+                        momentum_hope += 8
+                        momentum_hope_factors.append(f"✅ RSI healthy ({rsi:.0f})")
+                    
+                    # Price still below key MAs
+                    if current_close < context.get('ema_20', float('inf')):
+                        momentum_hope += 10
+                        momentum_hope_factors.append("📊 Below EMA20")
+                
+                # Apply momentum hope reduction to reversal score
+                # BUT only if drawdown is not critical (under 40%)
+                if momentum_hope > 0 and drawdown_pct_of_peak < 40:
+                    hope_reduction = min(momentum_hope, 25)  # Cap reduction at 25 points
+                    original_score = reversal_score
+                    reversal_score = max(0, reversal_score - hope_reduction)
+                    if hope_reduction > 10:
+                        logger.info(f"💪 {symbol}: MOMENTUM HOPE reduces reversal score {original_score:.0f}→{reversal_score:.0f} | {momentum_hope_factors[:2]}")
+                        reversal_factors.append(f"💪 Hope -{hope_reduction}pts: {momentum_hope_factors[0]}")
+                
+                # Log momentum hope if significant
+                if momentum_hope >= 20:
+                    logger.info(f"💪 {symbol}: Strong momentum hope ({momentum_hope}pts): {' | '.join(momentum_hope_factors[:3])}")
+                
                 # === HARDCODED FALLBACK SAFETY NET ===
                 # These trigger REGARDLESS of intelligent score - absolute protection
                 # In case intelligent detection fails, these ensure we don't lose big profits
+                # 
+                # KEY INSIGHT: Exit when we've lost 30-40% of peak, NOT 50-70%!
+                # Example: Peak 0.72%, lost 40% = exit at 0.43%, NOT at 0.10%
+                # 
+                # Using PERCENTAGE thresholds (matches Bybit display)
+                # BUT: If momentum hope is VERY strong (30+), allow more drawdown before trigger
                 hardcoded_triggered = False
+                strong_hope = momentum_hope >= 30  # Very strong momentum with us
                 
-                # MOST IMPORTANT: Major drawdown from peak = CRITICAL regardless of momentum
-                if peak_profit_usd >= 1.5 and drawdown_pct_of_peak >= 50:
-                    # Lost 50%+ of $1.50+ peak = CRITICAL EXIT NOW
-                    reversal_score = max(reversal_score, 80)
+                # Adjust thresholds based on momentum hope
+                # Strong hope = give trade more room to breathe
+                drawdown_threshold_1 = 35 if strong_hope else 25  # Good profit peak (0.5%+)
+                drawdown_threshold_2 = 45 if strong_hope else 35  # Medium profit peak (0.3%+)
+                drawdown_threshold_3 = 55 if strong_hope else 45  # Small profit peak (0.2%+)
+                
+                # === PERCENTAGE-BASED PROFIT PROTECTION ===
+                # Exit at 25-35% drawdown instead of waiting for 50%+
+                
+                # TIER 1: Good profit (0.5%+) - protect at 25-35% drawdown
+                if peak_profit_pct >= 0.5 and drawdown_pct_of_peak >= drawdown_threshold_1:
+                    reversal_score = max(reversal_score, 70)
                     hardcoded_triggered = True
-                    reversal_factors.append(f"🚨 HARDCODED: Lost {drawdown_pct_of_peak:.0f}% of ${peak_profit_usd:.2f} peak!")
-                    logger.warning(f"🚨🚨 {symbol}: HARDCODED CRITICAL - Lost {drawdown_pct_of_peak:.0f}% of ${peak_profit_usd:.2f} peak profit!")
+                    remaining_pct = 100 - drawdown_pct_of_peak
+                    hope_note = " (momentum hope gave extra room)" if strong_hope else ""
+                    reversal_factors.append(f"🚨 PROTECT: Keep {remaining_pct:.0f}% of {peak_profit_pct:.2f}% peak!{hope_note}")
+                    logger.warning(f"🚨 {symbol}: PROFIT PROTECTION - Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak, exiting at {pnl_pct:.2f}%!{hope_note}")
                 
-                elif peak_profit_usd >= 1.0 and drawdown_pct_of_peak >= 70:
-                    # Lost 70%+ of $1+ peak = CRITICAL
+                # TIER 2: Medium profit (0.3%+) - protect at 35-45% drawdown
+                elif peak_profit_pct >= 0.3 and drawdown_pct_of_peak >= drawdown_threshold_2:
                     reversal_score = max(reversal_score, 75)
                     hardcoded_triggered = True
-                    reversal_factors.append(f"🚨 HARDCODED: Lost {drawdown_pct_of_peak:.0f}% of peak!")
-                    logger.warning(f"🚨 {symbol}: HARDCODED HIGH - Lost {drawdown_pct_of_peak:.0f}% of ${peak_profit_usd:.2f} peak profit!")
+                    hope_note = " (momentum gave extra room)" if strong_hope else ""
+                    reversal_factors.append(f"🚨 CRITICAL: Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak!{hope_note}")
+                    logger.warning(f"🚨 {symbol}: CRITICAL - Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak!{hope_note}")
                 
+                # TIER 3: Small profit (0.2%+) - protect at 45-55% drawdown
+                elif peak_profit_pct >= 0.2 and drawdown_pct_of_peak >= drawdown_threshold_3:
+                    reversal_score = max(reversal_score, 65)
+                    hardcoded_triggered = True
+                    reversal_factors.append(f"⚠️ Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak")
+                    logger.warning(f"⚠️ {symbol}: Lost {drawdown_pct_of_peak:.0f}% of {peak_profit_pct:.2f}% peak!")
+                
+                # ABSOLUTE FLOOR: Never let meaningful profit disappear completely!
+                # If we had 0.4%+ peak and now under 0.1% = EXIT NOW
+                elif peak_profit_pct >= 0.4 and pnl_pct <= 0.1 and pnl_pct > 0:
+                    reversal_score = max(reversal_score, 80)
+                    hardcoded_triggered = True
+                    reversal_factors.append(f"🚨 FLOOR: {peak_profit_pct:.2f}% peak → {pnl_pct:.2f}% remaining!")
+                    logger.warning(f"🚨🚨 {symbol}: PROFIT FLOOR - Had {peak_profit_pct:.2f}%, now only {pnl_pct:.2f}%! EXIT NOW!")
+                
+                # LARGE USD PROFIT: $10+ with strong reversal = CRITICAL
                 elif pnl_usd >= 10.0 and momentum_against and very_strong_reversal:
-                    # $10+ profit with STRONG reversal = CRITICAL no matter what
                     if reversal_urgency not in ['critical']:
                         reversal_score = max(reversal_score, 75)
                         hardcoded_triggered = True
                         reversal_factors.append("🛡️ HARDCODED: $10+ with strong reversal")
                         logger.warning(f"🛡️ {symbol}: HARDCODED FALLBACK triggered - $10+ profit at risk!")
                 
+                # MEDIUM USD PROFIT: $5+ with strong momentum against = HIGH minimum
                 elif pnl_usd >= 5.0 and momentum_against and strong_momentum_against:
-                    # $5+ profit with strong momentum against = HIGH minimum
                     if reversal_urgency not in ['critical', 'high']:
                         reversal_score = max(reversal_score, 55)
                         hardcoded_triggered = True
@@ -2504,17 +3083,18 @@ Respond ONLY with JSON:
                     hardcoded_triggered = True
                     reversal_factors.append(f"⚡ FAST: {pnl_pct:.1f}% at risk")
                 
-                # === SMALL PROFIT REVERSAL - STRONG MOMENTUM/AI TRIGGER ===
-                # Even tiny profit can trigger exit if momentum is very strong against us
-                elif fast_reversal_score >= 55 and pnl_usd > 0:
-                    # VERY strong fast reversal on any profit = exit now
+                # === SMALL PROFIT REVERSAL - BALANCED APPROACH ===
+                # Don't cut tiny profits too early, but protect meaningful ones
+                # Score 60+ with $0.15+ profit = worth protecting
+                elif fast_reversal_score >= 60 and pnl_usd >= 0.15:
+                    # Strong reversal on small but meaningful profit = consider exit
                     reversal_score = max(reversal_score, 50)
                     hardcoded_triggered = True
-                    reversal_factors.append(f"⚡ STRONG reversal on ${pnl_usd:.2f}")
-                    logger.warning(f"⚡ {symbol}: STRONG REVERSAL on small profit ${pnl_usd:.2f}")
+                    reversal_factors.append(f"⚡ Strong reversal on ${pnl_usd:.2f}")
+                    logger.warning(f"⚡ {symbol}: STRONG REVERSAL on profit ${pnl_usd:.2f}")
                 
-                elif fast_reversal_score >= 40 and very_strong_reversal and pnl_usd > 0:
-                    # Fast reversal + strong ROC momentum = don't wait
+                elif fast_reversal_score >= 45 and very_strong_reversal and pnl_usd >= 0.10:
+                    # Fast reversal + strong ROC momentum on any profit = protect it
                     reversal_score = max(reversal_score, 45)
                     hardcoded_triggered = True
                     reversal_factors.append(f"⚡ Momentum+Fast on ${pnl_usd:.2f}")
@@ -2537,39 +3117,39 @@ Respond ONLY with JSON:
                         logger.warning(f"🟢 {symbol}: SHORT oversold RSI={rsi:.0f} + profit ${pnl_usd:.2f} - EXIT!")
                 
                 # === CLASSIFY URGENCY BASED ON REVERSAL SCORE ===
-                # Dynamic thresholds based on the calculated score (may be boosted by hardcoded)
-                if reversal_score >= 70:
+                # MORE AGGRESSIVE thresholds to exit earlier and protect profits!
+                if reversal_score >= 55:  # Was 70
                     profit_reversal_detected = True
                     reversal_urgency = 'critical'
                     reversal_reason = f"CRITICAL: Score {reversal_score:.0f}/100 | Peak ${peak_profit_usd:.2f}→${pnl_usd:.2f} | " + " | ".join(reversal_factors[:2])
                     logger.warning(f"🚨🚨 {symbol}: {reversal_reason}")
                     
-                elif reversal_score >= 50:
+                elif reversal_score >= 40:  # Was 50
                     profit_reversal_detected = True
                     reversal_urgency = 'high'
                     reversal_reason = f"HIGH: Score {reversal_score:.0f}/100 | Peak ${peak_profit_usd:.2f}→${pnl_usd:.2f} | " + " | ".join(reversal_factors[:2])
                     logger.warning(f"🔴 {symbol}: {reversal_reason}")
                     
-                elif reversal_score >= 35:
+                elif reversal_score >= 28:  # Was 35
                     profit_reversal_detected = True
                     reversal_urgency = 'medium'
                     reversal_reason = f"MEDIUM: Score {reversal_score:.0f}/100 | Peak ${peak_profit_usd:.2f}→${pnl_usd:.2f}"
                     logger.warning(f"🟠 {symbol}: {reversal_reason}")
                     
-                elif reversal_score >= 20 and pnl_pct > 0:
+                elif reversal_score >= 15 and pnl_pct > 0:  # Was 20
                     profit_reversal_detected = True
                     reversal_urgency = 'low'
                     reversal_reason = f"LOW: Score {reversal_score:.0f}/100 | Watching..."
                     logger.info(f"🟡 {symbol}: {reversal_reason}")
                 
-                # Log peak tracking for debugging
-                if peak_profit_usd > pnl_usd and peak_profit_usd > 1.0:
-                    logger.info(f"📊 {symbol}: Peak ${peak_profit_usd:.2f} → Now ${pnl_usd:.2f} | Drawdown: ${drawdown_usd:.2f} ({drawdown_pct_of_peak:.0f}%) | Score: {reversal_score:.0f}")
+                # Log peak tracking for debugging (like Bybit: $0.05 (+0.72%))
+                if peak_profit_pct > pnl_pct and peak_profit_pct > 0.3:
+                    logger.info(f"📊 {symbol}: Peak ${peak_profit_usd:.2f} ({peak_profit_pct:.2f}%) → Now ${pnl_usd:.2f} ({pnl_pct:.2f}%) | Lost {drawdown_pct_of_peak:.0f}% of gain | RevScore: {reversal_score:.0f}")
                 
-                # Always log peak status for positions in profit 
-                if pnl_usd > 0.5 or pnl_pct > 0.5:
+                # Always log peak status for positions in meaningful profit 
+                if pnl_pct > 0.3 or pnl_usd > 0.5:
                     hc_tag = " [HC]" if hardcoded_triggered else ""
-                    logger.info(f"📈 {symbol}: PnL ${pnl_usd:.2f}/{pnl_pct:.1f}% | Peak ${peak_profit_usd:.2f} | RevScore: {reversal_score:.0f}{hc_tag}")
+                    logger.info(f"📈 {symbol}: PnL ${pnl_usd:.2f} ({pnl_pct:+.2f}%) | Peak {peak_profit_pct:.2f}% | RevScore: {reversal_score:.0f}{hc_tag}")
             
             # Store updated peak values for next cycle (return to caller to save)
             peak_tracking = {
@@ -2670,11 +3250,89 @@ Respond ONLY with JSON:
             math_action = 'hold'
             math_reasoning = []
             
-            # Decision thresholds - SAME for both (cut losses as fast as profits)
+            # === FAST EXIT: Only at 0.0% to -0.1% loss IF price WANTS to go against us ===
+            # This catches bad entries where direction was wrong AND there's NO recovery chance
+            # Must be VERY strict - only exit if ALL indicators confirm no hope
+            FAST_EXIT_WINDOW = 45  # First 45 seconds only
+            FAST_EXIT_MAX_LOSS = -0.1  # Between 0.0% and -0.1% (breakeven to tiny loss)
+            FAST_EXIT_MIN_LOSS = 0.0  # Don't exit if we're in profit!
+            
+            # Calculate "no recovery chance" score - must be VERY high to trigger fast exit
+            no_recovery_score = 0
+            no_recovery_reasons = []
+            
+            # Factor 1: Strong momentum against (ROC5 and ROC10 both against us)
+            if is_long:
+                if roc_5 < -0.4:  # Strong bearish
+                    no_recovery_score += 30
+                    no_recovery_reasons.append(f"ROC5={roc_5:+.2f}%")
+                if roc_10 < -0.3:  # Sustained bearish
+                    no_recovery_score += 20
+                    no_recovery_reasons.append(f"ROC10={roc_10:+.2f}%")
+                if accelerating_against:  # Getting worse
+                    no_recovery_score += 15
+                    no_recovery_reasons.append("Accelerating down")
+            else:  # SHORT
+                if roc_5 > 0.4:  # Strong bullish
+                    no_recovery_score += 30
+                    no_recovery_reasons.append(f"ROC5={roc_5:+.2f}%")
+                if roc_10 > 0.3:  # Sustained bullish
+                    no_recovery_score += 20
+                    no_recovery_reasons.append(f"ROC10={roc_10:+.2f}%")
+                if accelerating_against:  # Getting worse
+                    no_recovery_score += 15
+                    no_recovery_reasons.append("Accelerating up")
+            
+            # Factor 2: No momentum hope at all
+            momentum_hope_score = momentum_hope if 'momentum_hope' in dir() else 0
+            if momentum_hope_score == 0:
+                no_recovery_score += 20
+                no_recovery_reasons.append("No momentum hope")
+            elif momentum_hope_score < 10:
+                no_recovery_score += 10
+                no_recovery_reasons.append(f"Low hope ({momentum_hope_score})")
+            
+            # Factor 3: Fast reversal already detected
+            if 'fast_reversal_score' in dir() and fast_reversal_score >= 40:
+                no_recovery_score += 15
+                no_recovery_reasons.append(f"Fast rev={fast_reversal_score}")
+            
+            # ONLY trigger fast exit if:
+            # 1. Within first 45 seconds
+            # 2. At breakeven to -0.1% loss (not in profit, not too deep loss)
+            # 3. No recovery score >= 70 (very high confidence no recovery)
+            no_recovery_chance = no_recovery_score >= 70
+            
+            in_fast_exit_zone = pnl_pct <= FAST_EXIT_MIN_LOSS and pnl_pct >= FAST_EXIT_MAX_LOSS
+            
+            if hold_seconds <= FAST_EXIT_WINDOW and in_fast_exit_zone and no_recovery_chance:
+                # Price went against us immediately AND multiple factors confirm no recovery
+                logger.warning(f"🚨 {symbol}: FAST EXIT! PnL={pnl_pct:.2f}% in {hold_seconds:.0f}s | No Recovery Score={no_recovery_score} | {', '.join(no_recovery_reasons[:3])}")
+                math_action = 'close'
+                math_reasoning.append(f"🚨 FAST EXIT: No recovery ({no_recovery_score}pts) | {', '.join(no_recovery_reasons[:2])}")
+                return {
+                    'action': 'close',
+                    'confidence': 0.95,
+                    'math_score': 90,
+                    'ai_validated': True,
+                    'reasoning': '; '.join(math_reasoning),
+                    'sl_adjustment': None,
+                    'peak_profit_pct': peak_profit_pct,
+                    'peak_profit_usd': peak_profit_usd
+                }
+            elif hold_seconds <= FAST_EXIT_WINDOW and in_fast_exit_zone:
+                # Log why we're NOT fast exiting
+                logger.info(f"⏳ {symbol}: In fast exit zone ({pnl_pct:.2f}%) but recovery possible (score={no_recovery_score}/70)")
+            
+            # === NO GRACE PERIOD - Let math and AI decide ===
+            # Grace period was causing losses by holding bad positions too long
+            # Now we rely on math exit score vs hold score + fast exit for bad entries
+            
+            # Decision thresholds - based on P&L state
             if pnl_pct > 0:
-                exit_threshold = 12  # Easier to exit when in profit
+                exit_threshold = 12  # Easier to exit when in profit (after grace)
             else:
-                exit_threshold = 12  # CHANGED: Same as profit - cut losses fast!
+                exit_threshold = 25  # Harder to cut losses (was 15, increased to give more time)
             
             if adjusted_exit_score > hold_score + exit_threshold:
                 math_action = 'close'
@@ -2702,7 +3360,15 @@ Respond ONLY with JSON:
             reversal_score = peak_tracking.get('reversal_score', 0)
             drawdown_pct = peak_tracking.get('drawdown_pct_of_peak', 0)
             
-            if profit_reversal_detected:
+            # IMPORTANT: Only trigger reversal protection if peak profit was meaningful
+            # Don't trigger on tiny fluctuations (< $1.00 or < 0.5%)
+            # Increased from $0.50/0.30% because small peaks were causing premature exits
+            min_peak_for_reversal = 1.00  # At least $1.00 peak profit to trigger reversal protection
+            min_peak_pct_for_reversal = 0.50  # At least 0.5% profit to trigger reversal protection
+            
+            peak_was_meaningful = peak_profit_usd >= min_peak_for_reversal or peak_profit_pct >= min_peak_pct_for_reversal
+            
+            if profit_reversal_detected and peak_was_meaningful:
                 # CRITICAL: Reversal score >= 70 OR lost 50%+ of peak profit → EXIT NOW
                 if reversal_urgency == 'critical' or (drawdown_pct >= 50 and peak_profit_usd > 1.0):
                     math_override_exit = True
@@ -2727,6 +3393,10 @@ Respond ONLY with JSON:
                 # LOW: Just flag for AI consideration, don't override
                 elif reversal_urgency == 'low':
                     math_reasoning.append(f"⚠️ Reversal detected (Score={reversal_score:.0f}) - AI will decide")
+            elif profit_reversal_detected and not peak_was_meaningful:
+                # Peak profit was too small to trigger reversal protection
+                logger.info(f"💡 {symbol}: Reversal detected but peak was small (${peak_profit_usd:.2f}/{peak_profit_pct:.2f}%) - letting position develop")
+                math_reasoning.append(f"💡 Small peak (${peak_profit_usd:.2f}) - holding for bigger move")
             
             # === PHASE 6: AI VALIDATION FOR ALL DECISIONS ===
             # AI now has POWERFUL control - it can override or refine decisions
@@ -2736,10 +3406,16 @@ Respond ONLY with JSON:
             ai_confidence = 0.5
             ai_suggested_action = 'hold'
             
+            # Log whether AI will be consulted
+            if math_override_exit:
+                logger.info(f"🛡️ {symbol}: Math Override active - skipping AI consultation for profit protection")
+            
             # Always consult AI for position decisions (not just when math says close)
             # BUT skip AI consultation if math override is active (profit protection takes priority)
             if self.use_ai and not math_override_exit:
+                logger.info(f"🤖 {symbol}: Consulting AI for exit decision (reversal_score={reversal_score:.0f}, hope={momentum_hope if 'momentum_hope' in dir() else 0})")
                 # Get AI opinion with deep math analysis
+                # Include momentum hope so AI knows if there's reason to hold
                 ai_result = self._ai_smart_exit_decision(
                     symbol=symbol,
                     side=side,
@@ -2754,7 +3430,10 @@ Respond ONLY with JSON:
                     df=df,
                     profit_reversal_detected=profit_reversal_detected,
                     reversal_urgency=reversal_urgency,
-                    reversal_reason=reversal_reason
+                    reversal_reason=reversal_reason,
+                    momentum_hope=momentum_hope if 'momentum_hope' in dir() else 0,
+                    momentum_hope_factors=momentum_hope_factors if 'momentum_hope_factors' in dir() else [],
+                    reversal_score=reversal_score if 'reversal_score' in dir() else 0
                 )
                 
                 if ai_result:
@@ -2764,12 +3443,30 @@ Respond ONLY with JSON:
                     ai_reason = ai_result.get('reasoning', '')
                     ai_suggested_action = ai_result.get('suggested_action', 'hold')
                     
+                    # === SMART GRACE PERIOD - ALLOWS INTELLIGENT REVERSALS ===
+                    # During grace period, AI can still force exit IF:
+                    # 1. Loss exceeds -1.0% (meaningful loss)
+                    # 2. AI has 85%+ confidence (strong signal)
+                    # 3. Reversal score >= 50 (strong reversal detected)
+                    # 4. Fast reversal score >= 40 (quick momentum shift)
+                    # 5. We're in profit AND momentum is strongly against us
+                    # 6. PROFIT→LOSS: We had meaningful profit but now in loss
+                    # NOTE: Grace period REMOVED - was causing losses by blocking exits
+                    
                     # AI has POWERFUL control - respect its suggestion
-                    if ai_suggested_action == 'exit' and ai_confidence >= 0.70:
-                        math_action = 'close'
-                        ai_agrees_to_exit = True  # CRITICAL: Mark AI agrees to exit!
-                        math_reasoning.append(f"🤖 AI OVERRIDE: EXIT ({ai_confidence:.0%}): {ai_reason}")
-                        logger.warning(f"🚨 AI OVERRIDE CLOSE for {symbol}: {ai_reason} (conf={ai_confidence:.0%})")
+                    # AI needs 85% confidence to override on LOSSES (was 75% but exited too quickly)
+                    # On PROFITS, 75% is still enough to protect gains
+                    ai_override_threshold = 0.75 if pnl_usd > 0 else 0.85
+                    if ai_suggested_action == 'exit' and ai_confidence >= ai_override_threshold:
+                        # Additional check for losses: only AI override if loss is meaningful (>0.5%)
+                        if pnl_pct >= 0 or (pnl_pct < 0 and pnl_pct <= -0.5):
+                            math_action = 'close'
+                            ai_agrees_to_exit = True  # CRITICAL: Mark AI agrees to exit!
+                            math_reasoning.append(f"🤖 AI OVERRIDE: EXIT ({ai_confidence:.0%}): {ai_reason}")
+                            logger.warning(f"🚨 AI OVERRIDE CLOSE for {symbol}: {ai_reason} (conf={ai_confidence:.0%})")
+                        else:
+                            math_reasoning.append(f"🤖 AI wanted exit but loss too small ({pnl_pct:.2f}%) - HOLDING")
+                            logger.info(f"⏳ {symbol}: AI EXIT blocked - loss {pnl_pct:.2f}% < 0.5%, waiting for recovery")
                     # AI + FAST REVERSAL COMBO: Even small profit, if AI says exit + fast signals strong
                     elif ai_suggested_action == 'exit' and ai_confidence >= 0.60 and fast_reversal_score >= 35 and pnl_usd > 0:
                         math_action = 'close'
@@ -2847,6 +3544,9 @@ Respond ONLY with JSON:
                     if new_sl < current_sl:
                         sl_adjustment = new_sl
                         math_reasoning.append(f"SL tightened: ${current_sl:.4f} → ${new_sl:.4f}")
+            
+            # === FINAL DECISION READY ===
+            # Grace period safety removed - was causing losses by blocking exits
             
             result = {
                 'action': math_action,
@@ -3107,24 +3807,10 @@ Respond ONLY with JSON:
             in_support_caution = support_upper < current_price <= support_caution_upper
             
             # ═══════════════════════════════════════════════════════════════
-            # LEGACY: Count bounces for additional confirmation
+            # NOTE: Touch counts already calculated above using smart detection
+            # Legacy counting removed to prevent overwriting smart counts
+            # resistance_touches and support_touches are preserved from lines 3602-3624
             # ═══════════════════════════════════════════════════════════════
-            tolerance_pct = 0.003
-            tolerance = current_price * tolerance_pct
-            
-            # Count resistance tests
-            resistance_touches = 0
-            for i, h in enumerate(highs):
-                if abs(h - high_24h) <= tolerance:
-                    if i < len(highs) - 1 and closes[i+1] < h:
-                        resistance_touches += 1
-            
-            # Count support tests
-            support_touches = 0
-            for i, l in enumerate(lows):
-                if abs(l - low_24h) <= tolerance:
-                    if i < len(lows) - 1 and closes[i+1] > l:
-                        support_touches += 1
             
             # Calculate distances
             distance_to_resistance = high_24h - current_price
@@ -3270,15 +3956,16 @@ Respond ONLY with JSON:
             detailed_analysis['rsi_penalty'] = rsi_penalty
         
         # SOFT PENALTY for oversold SHORT (was hard block at 25)
+        # Moderate penalties - between harsh original and weak test
         elif signal == -1 and current_rsi <= 30:
             if current_rsi <= 20:
-                rsi_penalty = -50  # Extreme oversold: massive penalty
+                rsi_penalty = -35  # Moderate: Was -50 original, -20 test
                 rsi_warning = f"⚠️ EXTREME OVERSOLD: RSI={current_rsi:.0f} (≤20) - Very high bounce risk"
             elif current_rsi <= 25:
-                rsi_penalty = -35  # Very oversold: heavy penalty
+                rsi_penalty = -25  # Moderate: Was -35 original, -15 test
                 rsi_warning = f"⚠️ OVERSOLD: RSI={current_rsi:.0f} (≤25) - High bounce risk"
             else:  # 26-30
-                rsi_penalty = -20  # Moderately oversold: moderate penalty
+                rsi_penalty = -15  # Moderate: Was -20 original, -10 test
                 rsi_warning = f"⚠️ RSI depressed: {current_rsi:.0f} (≤30) - Caution for SHORT"
             logger.debug(f"📊 [SOFT PENALTY] SHORT gets RSI penalty: {rsi_penalty} (RSI={current_rsi:.1f})")
             reasons_against.append(rsi_warning)
@@ -3432,7 +4119,9 @@ Respond ONLY with JSON:
                 
                 # Annualized slope (assuming 15-min bars)
                 bars_per_year = 365 * 24 * 4  # 4 bars per hour
-                annualized_return = (np.exp(slope * bars_per_year) - 1) * 100
+                # Clip to prevent overflow (max reasonable annual return is ~10000%)
+                exp_arg = np.clip(slope * bars_per_year, -10, 10)
+                annualized_return = (np.exp(exp_arg) - 1) * 100
                 
                 detailed_analysis['regression_slope'] = slope
                 detailed_analysis['r_squared'] = r_squared
@@ -4024,14 +4713,16 @@ Respond ONLY with JSON:
         # FINAL BAYESIAN-WEIGHTED SCORE CALCULATION WITH CONFIDENCE INTERVALS
         # ═══════════════════════════════════════════════════════════════════
         # Weights based on predictive importance (can be updated via Bayesian learning)
+        # FIXED: Added Kalman momentum (was calculated but not weighted)
         weights = {
-            'risk_reward': 0.12,   # Kelly/R:R
-            'trend': 0.15,         # Regression-based trend
-            'hurst': 0.10,         # Fractal analysis / HMM regime
-            'volatility': 0.08,    # GARCH-style
-            'zscore': 0.10,        # Mean reversion
-            'momentum': 0.12,      # RSI with divergence
-            'volume': 0.10,        # VWAP analysis
+            'risk_reward': 0.11,   # Kelly/R:R
+            'trend': 0.13,         # Regression-based trend
+            'hurst': 0.09,         # Fractal analysis / HMM regime
+            'volatility': 0.07,    # GARCH-style
+            'zscore': 0.09,        # Mean reversion
+            'momentum': 0.11,      # RSI with divergence
+            'volume': 0.09,        # VWAP analysis
+            'kalman': 0.08,        # Kalman filter momentum (NEW!)
             'autocorr': 0.05,      # Predictability
             'tail_risk': 0.05,     # Skew/Kurtosis
             'risk_metrics': 0.05,  # Sharpe/Sortino
@@ -4052,6 +4743,35 @@ Respond ONLY with JSON:
             pre_penalty_score = final_score
             final_score = max(0, final_score + soft_penalty)  # soft_penalty is negative
             logger.debug(f"📊 Score after soft penalties: {pre_penalty_score:.0f} → {final_score:.0f} (penalty: {soft_penalty})")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # MOMENTUM DIRECTION PENALTY - CRITICAL!
+        # If momentum is going AGAINST the signal direction, heavily penalize!
+        # This is the #1 cause of losses - entering against momentum
+        # ═══════════════════════════════════════════════════════════════════
+        roc_5 = context.get('roc_5', 0) if context else 0
+        roc_10 = context.get('roc_10', 0) if context else 0
+        kalman_momentum = context.get('kalman_momentum', 0) if context else 0
+        
+        momentum_direction_penalty = 0
+        if signal == 1:  # LONG - need POSITIVE momentum
+            if roc_5 < -0.3:  # Strong negative momentum
+                momentum_direction_penalty = -30
+                reasons_against.append(f"🚫 WRONG DIRECTION: LONG with FALLING price (ROC5={roc_5:+.2f}%)")
+            elif roc_5 < 0:  # Negative momentum
+                momentum_direction_penalty = -15
+                reasons_against.append(f"⚠️ LONG against momentum (ROC5={roc_5:+.2f}%)")
+        elif signal == -1:  # SHORT - need NEGATIVE momentum
+            if roc_5 > 0.3:  # Strong positive momentum
+                momentum_direction_penalty = -30
+                reasons_against.append(f"🚫 WRONG DIRECTION: SHORT with RISING price (ROC5={roc_5:+.2f}%)")
+            elif roc_5 > 0:  # Positive momentum
+                momentum_direction_penalty = -15
+                reasons_against.append(f"⚠️ SHORT against momentum (ROC5={roc_5:+.2f}%)")
+        
+        if momentum_direction_penalty != 0:
+            final_score = max(0, final_score + momentum_direction_penalty)
+            logger.info(f"📊 Momentum direction penalty: {momentum_direction_penalty} (ROC5={roc_5:+.2f}%)")
         
         # ═══════════════════════════════════════════════════════════════════
         # HIGH VOLATILITY PENALTY (Added after SUI/XRP loss analysis)
@@ -4668,18 +5388,19 @@ Respond ONLY with JSON:
                 elif math_direction == "SHORT" and dist_to_sup < 2.0 and sup_touches >= 2:
                     level_warning += f"\n🚨 DANGER FOR SHORT: Price is only {dist_to_sup:.1f}% above 24h support (tested {sup_touches}x and held). High probability of bounce!"
             
-            # Get market news and sentiment context (NEW!)
+            # Get market news and sentiment context (RECOMMENDATION ONLY!)
             news_ctx = self._get_news_context()
             news_section = ""
             if news_ctx.get('fear_greed_index', 50) != 50 or news_ctx.get('warning'):
                 news_section = f"""
-=== 📰 MARKET NEWS & SENTIMENT (LIVE) ===
+=== 📰 MARKET SENTIMENT (RECOMMENDATION ONLY - NOT A HARD RULE) ===
 Fear & Greed Index: {news_ctx.get('fear_greed_index', 50)} ({news_ctx.get('fear_greed_label', 'Unknown')})
 Market Cap 24h Change: {news_ctx.get('market_cap_change_24h', 0):+.2f}%
 News Sentiment: {news_ctx.get('news_sentiment', 0):+.2f} (Bullish: {news_ctx.get('bullish_news_count', 0)}, Bearish: {news_ctx.get('bearish_news_count', 0)})
 {f"Critical News: {news_ctx.get('critical_news_count', 0)} alerts" if news_ctx.get('critical_news_count', 0) > 0 else ''}
 {chr(10).join('• ' + h for h in news_ctx.get('critical_headlines', [])[:2]) if news_ctx.get('critical_headlines') else ''}
-{news_ctx.get('warning', '')}
+⚠️ NOTE: Use this as CONTEXT only. Extreme fear can be a BUY opportunity (contrarian). 
+   Math analysis (momentum, Kalman) is MORE RELIABLE than daily sentiment.
 """
             
             # Add advanced math section if provided
@@ -4736,49 +5457,59 @@ Current Streak: {perf['consecutive_wins']}W / {perf['consecutive_losses']}L
 - The math score incorporates: Kalman momentum, POC distance, Hurst exponent, RSI divergence, GARCH volatility
 - Math score 55+ = STRONG signal, trust it!
 - Math score 50-54 = Good signal, approve if momentum aligns
-- Math score 45-49 = Weak signal, need strong momentum confirmation
+- Math score 45-49 = Marginal signal, need strong momentum confirmation
 
 **📊 HISTORICAL DATA IS SECONDARY (30% weight):**
 - Historical data is advisory only - it should NOT override good math
 - Use it as a TIE-BREAKER when math scores are similar for both directions
 - A good math signal should be approved even if historical data is limited
 
-**MINIMUM CONFIDENCE: 60%**
-- You MUST provide at least 60% confidence to approve
-- 70%+ confidence for high conviction (math 60+)
+**MINIMUM CONFIDENCE: 55%**
+- You MUST provide at least 55% confidence to approve
 
-**APPROVAL GUIDELINES (TRUST THE MATH!):**
-✅ Math score 55+ → APPROVE with 65%+ confidence (math is strong!)
-✅ Math score 50-54 + momentum aligns → APPROVE with 60%+ confidence
-✅ Math score 45-49 + strong momentum + volatility favorable → Consider approving
-✅ Direction matches Kalman momentum sign → Extra confidence boost
+**APPROVAL GUIDELINES (FOLLOW THESE!):**
+✅ Math score 70+ AND momentum aligns → APPROVE with 65-75% confidence
+✅ Math score 60-69 AND momentum aligns → APPROVE with 60-65% confidence
+✅ Math score 55-59 AND momentum aligns → APPROVE with 55-60% confidence
+⚠️ Math score 45-54 → APPROVE only with STRONG momentum confirmation
 
-**CRITICAL: TRUST THE NEW MATH SYSTEM!**
-- The PhD-level math (Kalman, POC, Hurst, GARCH) is our edge
-- Historical data is from the OLD less-smart system
-- If math says go, GO - don't let old history hold you back!
+**🚨 CRITICAL: CHECK MOMENTUM DIRECTION!**
+- For LONG: ROC5 MUST be positive (price rising) - otherwise REJECT!
+- For SHORT: ROC5 MUST be negative (price falling) - otherwise REJECT!
+- Math score alone is NOT enough - momentum direction MUST align!
 
-**WHEN TO REJECT:**
-❌ Math score < 45 (weak signal regardless of history)
-❌ Math direction conflicts with strong momentum (ROC5 > 0.5% opposite)
-❌ Near resistance for LONG or support for SHORT (level warnings)
-❌ Your confidence is below 55%
+**REJECTION IS REQUIRED FOR THESE CASES:**
+❌ Math score < 45 (weak signal - insufficient edge)
+❌ MOMENTUM CONFLICT: Math says LONG but ROC5 is negative (price falling!)
+❌ MOMENTUM CONFLICT: Math says SHORT but ROC5 is positive (price rising!)
+❌ RSI extreme AND against direction (RSI<20 for SHORT, RSI>80 for LONG)
 
-**DEFAULT BEHAVIOR:**
-- When math is good (50+), APPROVE
-- History is just context, not a veto
+**DO NOT REJECT FOR:**
+✓ "Low volume" - already factored into math score
+✓ "Limited history" - fresh start is intentional
+✓ "Uncertain direction" - math score tells you direction
+✓ "Multiple factors" - vague reasons are not valid
 
-**YOUR ROLE AS AI:**
-You are the FINAL QUALITY CHECK. Your job is to:
-1. CONFIRM good math signals (math 55+ = usually approve)
+**PICK THE BEST DIRECTION:**
+- If LONG score > SHORT score by 5+ AND ROC5 positive → approve LONG
+- If SHORT score > LONG score by 5+ AND ROC5 negative → approve SHORT
+- If momentum conflicts with math direction → REJECT (don't trade against momentum!)
+
+**CONFIDENCE GUIDELINES:**
+- Math 45-54 → confidence 0.55-0.60 (requires momentum alignment)
+- Math 55-64 → confidence 0.60-0.65
+- Math 65+ → confidence 0.65-0.75
+
+**YOUR ROLE:**
+1. Validate that MOMENTUM (ROC5) aligns with the trade direction
 2. ADD your own analysis of momentum, RSI, volume patterns
 3. CATCH edge cases math might miss (news events, unusual patterns)
 4. Choose the BEST direction if both are viable
 
 Your opinion MATTERS! If you see something math missed, say it.
-But don't reject just because history is limited - that's the OLD data.
+If momentum conflicts with math, you MUST reject - don't fight the trend!
 
-**DECISION WEIGHT: Math 60% + Your AI Analysis 40%**
+**DECISION WEIGHT: Math 50% + Momentum 30% + Your AI Analysis 20%**
 
 === YOUR RESPONSE ===
 Respond ONLY with this JSON (nothing else):
@@ -4816,15 +5547,15 @@ Confidence: 0.50-1.00 (0.55+ to approve)
                 reasoning = result.get('reasoning', 'AI decision')
                 
                 # Apply loss cooldown - require slightly higher confidence after losses
-                # But don't be so strict that we never trade!
+                # Moderate settings - not too strict, not too loose
                 if perf["consecutive_losses"] >= 3:
-                    required_conf = 0.65  # After 3+ losses, need solid confidence
+                    required_conf = 0.60  # After 3+ losses, need solid confidence
                 elif perf["consecutive_losses"] >= 2:
-                    required_conf = 0.60  # After 2 losses, reasonable confidence
+                    required_conf = 0.55  # After 2 losses, reasonable confidence
                 elif perf["last_trade_was_loss"]:
-                    required_conf = 0.58  # After 1 loss, slightly cautious
+                    required_conf = 0.52  # After 1 loss, slightly cautious
                 else:
-                    required_conf = 0.55  # Normal operation: trade when reasonable
+                    required_conf = 0.50  # Normal operation: trade when reasonable
                 
                 # If confidence too low, force REJECT
                 if decision != 'REJECT' and confidence < required_conf:
@@ -5499,7 +6230,10 @@ Respond ONLY with JSON:
         df: pd.DataFrame = None,
         profit_reversal_detected: bool = False,
         reversal_urgency: str = 'none',
-        reversal_reason: str = ''
+        reversal_reason: str = '',
+        momentum_hope: int = 0,
+        momentum_hope_factors: List[str] = None,
+        reversal_score: int = 0
     ) -> Optional[Dict[str, Any]]:
         """
         AI makes a POWERFUL exit decision with deep math understanding.
@@ -5533,6 +6267,45 @@ Respond ONLY with JSON:
             rsi = context.get('rsi', 50)
             volume_ratio = context.get('volume_ratio', 1.0)
             volatility = context.get('volatility_pct', 0)
+            
+            # === S/R LEVEL ANALYSIS ===
+            sr_levels = self._detect_resistance_support_levels(df, current_price)
+            dist_to_resistance = sr_levels.get('distance_to_resistance_pct', 99)
+            dist_to_support = sr_levels.get('distance_to_support_pct', 99)
+            range_position = sr_levels.get('position_in_range_pct', 50)
+            in_r_zone = sr_levels.get('in_resistance_zone', False)
+            in_s_zone = sr_levels.get('in_support_zone', False)
+            
+            # Build S/R context for AI with side-specific warnings
+            sr_context = f"Position in 24h range: {range_position:.0f}%\n"
+            sr_context += f"  • Distance to Resistance: {dist_to_resistance:.2f}%"
+            if in_r_zone:
+                sr_context += " 🚫 IN DANGER ZONE"
+            elif dist_to_resistance < 1.0:
+                sr_context += " ⚠️ VERY CLOSE"
+            sr_context += f"\n  • Distance to Support: {dist_to_support:.2f}%"
+            if in_s_zone:
+                sr_context += " 🚫 IN DANGER ZONE"
+            elif dist_to_support < 1.0:
+                sr_context += " ⚠️ VERY CLOSE"
+            
+            # Add side-specific S/R warnings
+            if side == 'LONG':
+                if in_r_zone:
+                    sr_context += "\n\n🚨 LONG IN RESISTANCE ZONE - HIGH EXIT URGENCY!"
+                    sr_context += f"\n   Price likely to reject here. Only {dist_to_resistance:.2f}% upside before resistance."
+                elif dist_to_resistance < 0.5:
+                    sr_context += f"\n\n⚠️ LONG very close to resistance ({dist_to_resistance:.2f}% away) - limited upside!"
+                if dist_to_support < 1.0:
+                    sr_context += f"\n   ✅ Support nearby ({dist_to_support:.2f}% below) - good protection"
+            else:  # SHORT
+                if in_s_zone:
+                    sr_context += "\n\n🚨 SHORT IN SUPPORT ZONE - HIGH EXIT URGENCY!"
+                    sr_context += f"\n   Price likely to bounce here. Only {dist_to_support:.2f}% downside before support."
+                elif dist_to_support < 0.5:
+                    sr_context += f"\n\n⚠️ SHORT very close to support ({dist_to_support:.2f}% away) - limited downside!"
+                if dist_to_resistance < 1.0:
+                    sr_context += f"\n   ✅ Resistance nearby ({dist_to_resistance:.2f}% above) - good protection"
             
             # Determine market regime
             if rsi < 30:
@@ -5578,6 +6351,17 @@ Volatility & Risk:
   • Risk/reward at current price: {math_analysis.get('current_rr', 0):.2f}
 
 ═══════════════════════════════════════════════════════════════════════════════
+📍 SUPPORT/RESISTANCE LEVELS
+═══════════════════════════════════════════════════════════════════════════════
+{sr_context}
+
+CRITICAL FOR EXITS:
+  • LONG near resistance → Higher chance of rejection, consider exit
+  • LONG near support → Support may hold, can hold
+  • SHORT near support → Higher chance of bounce, consider exit
+  • SHORT near resistance → Resistance may reject, can hold
+
+═══════════════════════════════════════════════════════════════════════════════
 🔮 MARKET CONDITIONS
 ═══════════════════════════════════════════════════════════════════════════════
 Trend: {trend_status.upper()}
@@ -5590,8 +6374,24 @@ Reversal Warning Signals:
 {'🚨🚨🚨 PROFIT REVERSAL ALERT 🚨🚨🚨' if profit_reversal_detected else ''}
 {f'URGENCY: {reversal_urgency.upper()}' if profit_reversal_detected else ''}
 {f'REASON: {reversal_reason}' if profit_reversal_detected else ''}
+{f'REVERSAL SCORE: {reversal_score}/100 (55+=CRITICAL, 40+=HIGH)' if reversal_score > 0 else ''}
 {f'The code detected momentum reversing against our profitable position!' if profit_reversal_detected else ''}
 {f'YOU MUST DECIDE: Capture this profit NOW or let it potentially evaporate?' if profit_reversal_detected else ''}
+
+═══════════════════════════════════════════════════════════════════════════════
+💪 MOMENTUM HOPE ANALYSIS (Reasons to HOLD)
+═══════════════════════════════════════════════════════════════════════════════
+Hope Score: {momentum_hope}/50 (higher = more reason to hold through dip)
+{chr(10).join(['  • ' + f for f in (momentum_hope_factors or [])]) if momentum_hope_factors else '  • No favorable momentum factors detected'}
+
+{'⚡ STRONG HOPE: Momentum is still WITH us despite the dip!' if momentum_hope >= 30 else ''}
+{'📊 MODERATE HOPE: Some favorable factors present' if 15 <= momentum_hope < 30 else ''}
+{'⚠️ LOW HOPE: Few reasons to expect recovery' if 0 < momentum_hope < 15 else ''}
+
+IMPORTANT: If REVERSAL SCORE is high but HOPE SCORE is also high, this is a critical decision point!
+- High reversal + Low hope = EXIT to protect profit
+- High reversal + High hope = Consider holding if trend is intact
+- Low reversal + High hope = HOLD, let it run
 
 ═══════════════════════════════════════════════════════════════════════════════
 🧠 DECISION FRAMEWORK
@@ -5599,14 +6399,14 @@ Reversal Warning Signals:
 IMPORTANT CONSIDERATIONS:
 
 FOR POSITIONS IN LOSS:
-  • Small loss (< -0.5%): Price noise is normal. If momentum supports our direction, HOLD
-  • Medium loss (-0.5% to -1.0%): Check if mean reversion could help. If RSI is extreme in our favor, consider waiting
-  • Large loss (> -1.0%): Check if there's a mathematical reason to expect recovery. Don't hope, analyze!
+  • Small loss (< -0.5%): Normal noise - HOLD if momentum supports our direction
+  • Medium loss (-0.5% to -1.0%): Check momentum and mean reversion potential
+  • Large loss (> -1.0%): Analyze carefully - exit if no recovery signals
 
 FOR POSITIONS IN PROFIT:
-  • Small profit (< +0.3%): Let it develop unless strong reversal signals
-  • Medium profit (+0.3% to +0.8%): Consider tightening SL, protect gains
-  • Good profit (> +0.8%): Be ready to exit on reversal signals
+  • Small profit (< +0.5%): LET IT RUN - only exit on VERY strong reversal (score>70)
+  • Medium profit (+0.5% to +1.0%): Can tighten SL but don't exit prematurely
+  • Good profit (> +1.0%): Protect actively, exit on clear reversal signals
   
 {'⚡ PROFIT REVERSAL DETECTED - Weight this heavily in your decision!' if profit_reversal_detected else ''}
 
@@ -5881,7 +6681,57 @@ Respond ONLY with JSON:
                     profit_protection_boost = erosion_boost
                     profit_protection_reason = f"PROFIT EROSION (was ${current_peak:.0f}, now ${estimated_pnl_usd:.0f})"
             
-            # Apply adjustments
+            # === S/R ZONE PENALTY: Exit when near danger zones ===
+            sr_penalty_to_hold = 0
+            sr_boost_to_exit = 0
+            sr_reason = ""
+            
+            sr_levels = self._detect_resistance_support_levels(df, current_price)
+            dist_to_resistance = sr_levels.get('distance_to_resistance_pct', 99)
+            dist_to_support = sr_levels.get('distance_to_support_pct', 99)
+            in_r_zone = sr_levels.get('in_resistance_zone', False)
+            in_s_zone = sr_levels.get('in_support_zone', False)
+            
+            if position_side == 'LONG':
+                if in_r_zone or dist_to_resistance < 0.5:
+                    # LONG hitting resistance - high exit urgency
+                    sr_penalty_to_hold = -25
+                    sr_boost_to_exit = 30
+                    sr_reason = f"🚫 LONG in/near resistance ({dist_to_resistance:.1f}% away)"
+                elif dist_to_resistance < 1.0:
+                    # LONG very close to resistance
+                    sr_penalty_to_hold = -15
+                    sr_boost_to_exit = 20
+                    sr_reason = f"⚠️ LONG close to resistance ({dist_to_resistance:.1f}% away)"
+                elif dist_to_resistance < 2.0:
+                    # LONG approaching resistance
+                    sr_penalty_to_hold = -8
+                    sr_boost_to_exit = 10
+                    sr_reason = f"📍 LONG approaching resistance ({dist_to_resistance:.1f}% away)"
+            else:  # SHORT
+                if in_s_zone or dist_to_support < 0.5:
+                    # SHORT hitting support - high exit urgency
+                    sr_penalty_to_hold = -25
+                    sr_boost_to_exit = 30
+                    sr_reason = f"🚫 SHORT in/near support ({dist_to_support:.1f}% away)"
+                elif dist_to_support < 1.0:
+                    # SHORT very close to support
+                    sr_penalty_to_hold = -15
+                    sr_boost_to_exit = 20
+                    sr_reason = f"⚠️ SHORT close to support ({dist_to_support:.1f}% away)"
+                elif dist_to_support < 2.0:
+                    # SHORT approaching support
+                    sr_penalty_to_hold = -8
+                    sr_boost_to_exit = 10
+                    sr_reason = f"📍 SHORT approaching support ({dist_to_support:.1f}% away)"
+            
+            # Apply S/R adjustments
+            if sr_penalty_to_hold != 0:
+                hold_score += sr_penalty_to_hold
+                exit_score += sr_boost_to_exit
+                logger.info(f"{sr_reason} | Hold penalty: {sr_penalty_to_hold}, Exit boost: +{sr_boost_to_exit}")
+            
+            # Apply profit protection adjustments
             exit_score += profit_protection_boost - patience_penalty
             
             if profit_protection_boost > 0:
